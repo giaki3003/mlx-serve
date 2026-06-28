@@ -766,9 +766,12 @@ pub const Generator = struct {
         const trace_force: bool = prefill_trace_force or readEnvBool("MLX_SERVE_PREFILL_TRACE") or transformer_mod.prefill_profile;
         const trace_enabled = log.isDebug() or trace_force;
         // Per-component prefill profiler (--prefill-profile / MLX_SERVE_PREFILL_PROFILE):
-        // reset the GDN/attn/MLP accumulators per request so the [prefill-profile]
-        // split is for this prompt.
-        if (transformer_mod.prefill_profile) transformer_mod.profReset();
+        // reset the GDN/attn/MLP accumulators per request and hand the forward our
+        // request `io` (this Zig has no std.time clock; timing is on std.Io).
+        if (transformer_mod.prefill_profile) {
+            transformer_mod.profReset();
+            transformer_mod.prof_io = io;
+        }
         var prefill_sw = io_util.Stopwatch.init(io);
         var chunked_ns: u64 = 0;
         var eval_ns: u64 = 0;

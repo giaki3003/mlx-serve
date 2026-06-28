@@ -19,6 +19,10 @@ pub var prefill_profile: bool = false;
 pub var prof_gdn_ns: u64 = 0;
 pub var prof_attn_ns: u64 = 0;
 pub var prof_mlp_ns: u64 = 0;
+// This Zig (0.16) has no std.time clock — timing lives on std.Io. generate.zig
+// (which holds the request `io`) stashes it here when profiling, so the forward
+// can timestamp without threading io through every call site.
+pub var prof_io: ?std.Io = null;
 
 pub fn profReset() void {
     prof_gdn_ns = 0;
@@ -30,8 +34,15 @@ inline fn profEval(arr: mlx.mlx_array) void {
     mlx.check(mlx.mlx_array_eval(arr)) catch {};
 }
 
-inline fn profSince(t0: i128) u64 {
-    const d = std.time.nanoTimestamp() - t0;
+inline fn profNow() ?std.Io.Timestamp {
+    const io = prof_io orelse return null;
+    return std.Io.Timestamp.now(io, .awake);
+}
+
+inline fn profSince(t0: ?std.Io.Timestamp) u64 {
+    const start = t0 orelse return 0;
+    const io = prof_io orelse return 0;
+    const d = start.untilNow(io, .awake).nanoseconds;
     return if (d > 0) @intCast(d) else 0;
 }
 
@@ -4979,13 +4990,13 @@ pub const Transformer = struct {
         }
 
         // Profiler: materialize the embedding so layer-0's mixer timing is clean.
-        if (prefill_profile and is_prefill) profEval(h);
+        if (prefill_profile and is_prefill and prof_io != null) profEval(h);
         for (0..cfg.num_hidden_layers) |layer_idx| {
             const li: u32 = @intCast(layer_idx);
             const lw = &ml[layer_idx];
 
-            const prof = prefill_profile and is_prefill;
-            const t_mix: i128 = if (prof) std.time.nanoTimestamp() else 0;
+            const prof = prefill_profile and is_prefill and prof_io != null;
+            const t_mix = if (prof) profNow() else null;
 
             const normed = try self.rmsNorm(h, lw.input_norm);
             defer _ = mlx.mlx_array_free(normed);
@@ -5008,7 +5019,7 @@ pub const Transformer = struct {
                     .full => prof_attn_ns += dt,
                 }
             }
-            const t_mlp: i128 = if (prof) std.time.nanoTimestamp() else 0;
+            const t_mlp = if (prof) profNow() else null;
 
             if (is_gemma4) {
                 h = try self.gemma4MoeLayerTail(h, attn_out, lw, ctx.use_encoder_scalars);
