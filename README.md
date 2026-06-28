@@ -327,6 +327,10 @@ Matches mlx-lm (Python) generation speed while using less memory and starting 3Ã
 Run 3 times and take the average of runs 2-3 (run 1 includes model loading from disk).
 </details>
 
+### Prefill tuning & presets
+
+For prompt-prefill / TTFT tuning (chunk size, SSM-checkpoint stride, caches, wired-memory limit) and the `--perf-preset {cold-prefill,coding-agent,low-memory,max-throughput}` bundles, see **[docs/PERF_TUNING.md](docs/PERF_TUNING.md)**. Sweep configs across prompt sizes with `tests/bench_prefill_sweep.sh <model>`, which parses the server's `[prefill-trace]` line for accurate cold/warm prefill throughput and reports whether the compiled-forward fast path engaged.
+
 ## Speculative Decoding
 
 Two flavors, both greedy-equivalent (byte-identical at temp=0 within the first 30 tokens; mathematically exact at temp > 0 via the Leviathan probability-ratio sampler):
