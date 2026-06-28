@@ -1155,10 +1155,14 @@ fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
 /// oversubscribe. Falls back to `getMetalBufferLimit()` when the device query
 /// is unavailable (CI / non-Metal hosts).
 fn getGpuWorkingSetLimit() u64 {
-    // P0a: when --wired-limit raised the Metal ceiling, budget the admission
-    // check against the raised value (not the device's ~12GB recommendation),
-    // so we admit the long prompts the higher wired limit now actually allows.
-    if (mlx.configured_wired_limit > 0) return mlx.configured_wired_limit;
+    // The HARD ceiling for GPU command buffers is the device's max working-set
+    // size (the wired cap) — Metal kills the command buffer there. --wired-limit
+    // raises the SOFT memory limit (mlx.configured_wired_limit), but that only
+    // lets MLX hold more reclaimable/pageable buffers; command buffers can't
+    // spill, so they still die at the wired cap. Budget admission against
+    // min(soft, wired) = the wired cap, or admitting a prompt that "fits" under
+    // the soft ceiling can still OOM at the wired one.
+    var device_rec: u64 = 0;
     var dev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&dev);
     var info = mlx.mlx_device_info_new();
@@ -1166,10 +1170,12 @@ fn getGpuWorkingSetLimit() u64 {
     if (mlx.mlx_device_info_get(&info, dev) == 0) {
         var max_rec: usize = 0;
         if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") == 0 and max_rec > 0) {
-            return @as(u64, max_rec);
+            device_rec = @as(u64, max_rec);
         }
     }
-    return getMetalBufferLimit();
+    if (device_rec == 0) device_rec = getMetalBufferLimit();
+    if (mlx.configured_wired_limit > 0) return @min(mlx.configured_wired_limit, device_rec);
+    return device_rec;
 }
 
 /// PURE budget math (no MLX/Metal calls — unit-testable): the largest context
