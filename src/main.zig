@@ -152,6 +152,14 @@ fn printUsage(io: std.Io) void {
         \\                        context doesn't OOM-abort below physical RAM.
         \\                        Default 'auto' = min(0.9*RAM, RAM-2GB); 'off'
         \\                        keeps the device recommendation (~12GB/16GB).
+        \\  --mlx-cache-limit <n>{{KB,MB,GB}}|off
+        \\                      Cap MLX's reclaimable buffer cache (it hoards
+        \\                        freed buffers in wired memory; ~1.5GB observed
+        \\                        eats command-buffer headroom). e.g. 512MB.
+        \\  --mtp-kv-quant {{off|4|8|turbo2|turbo4}}
+        \\                      Quantize the MTP head's own draft KV cache
+        \\                        (default off=f16). The committed-history draft
+        \\                        KV spans the full prompt; turbo4 cuts it ~4x.
         \\  --idle-evict-secs <n>
         \\                      Evict .ready entries with refcount==0 if
         \\                        idle for this many seconds. Default: off.
@@ -457,6 +465,22 @@ pub fn main(init: std.process.Init) !void {
                 };
                 wired_limit_mode = .explicit;
             }
+        } else if (std.mem.eql(u8, args[i], "--mlx-cache-limit") and i + 1 < args.len) {
+            i += 1;
+            if (std.mem.eql(u8, args[i], "off") or std.mem.eql(u8, args[i], "0")) {
+                mlx.configured_cache_limit = 0;
+            } else {
+                mlx.configured_cache_limit = parseSizeArg(args[i]) catch {
+                    log.err("--mlx-cache-limit: expected '<n>{{MB,GB,KB}}' or 'off'; got '{s}'\n", .{args[i]});
+                    std.process.exit(1);
+                };
+            }
+        } else if (std.mem.eql(u8, args[i], "--mtp-kv-quant") and i + 1 < args.len) {
+            i += 1;
+            mtp_mod.mtp_kv_quant = parseKvQuantArg(args[i]) orelse {
+                log.err("--mtp-kv-quant: expected one of {{off, 4, 8, turbo2, turbo4}}; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--idle-evict-secs") and i + 1 < args.len) {
             // Plan 05 Phase D: idle-tick eviction window. When set, the
             // inference loop's idle path evicts .ready entries (refcount==0)
@@ -638,6 +662,13 @@ pub fn main(init: std.process.Init) !void {
         log.info("[args] wired-limit: {d:.1} GB GPU memory ceiling (wired capped at the device working set; excess is pageable)\n", .{@as(f64, @floatFromInt(mlx.configured_wired_limit)) / 1_073_741_824.0});
     } else {
         log.info("[args] wired-limit: device default (recommended working set)\n", .{});
+    }
+    if (mlx.configured_cache_limit > 0) {
+        log.info("[args] mlx-cache-limit: {d} MB\n", .{mlx.configured_cache_limit / (1024 * 1024)});
+    }
+    switch (mtp_mod.mtp_kv_quant.scheme) {
+        .off => {},
+        else => log.info("[args] mtp-kv-quant: {s} {d}-bit\n", .{ @tagName(mtp_mod.mtp_kv_quant.scheme), mtp_mod.mtp_kv_quant.bits }),
     }
 
     // Set GPU as default
@@ -883,7 +914,7 @@ pub fn main(init: std.process.Init) !void {
                 var max_rec: usize = 0;
                 if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") == 0 and max_rec > 0) {
                     const r = mlx.applyGpuLimit(max_rec);
-                    log.info("GPU limit: wired {d}->{d} MB (device max {d} MB), memory ceiling {d} MB\n", .{ r.previous_wired / (1024 * 1024), r.wired_applied / (1024 * 1024), max_rec / (1024 * 1024), r.memory_applied / (1024 * 1024) });
+                    log.info("GPU limit: wired {d}->{d} MB (device max {d} MB), memory ceiling {d} MB, cache cap {d} MB (0=default)\n", .{ r.previous_wired / (1024 * 1024), r.wired_applied / (1024 * 1024), max_rec / (1024 * 1024), r.memory_applied / (1024 * 1024), r.cache_applied / (1024 * 1024) });
                 }
                 _ = mlx.mlx_device_info_free(info);
             }

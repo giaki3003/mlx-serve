@@ -329,6 +329,13 @@ pub extern "c" fn mlx_get_cache_memory(res: *usize) c_int;
 /// admission-check ceiling so both agree.
 pub var configured_wired_limit: u64 = 0;
 
+/// Process-wide cap on MLX's reclaimable buffer cache in bytes (`--mlx-cache-
+/// limit`). `0` = leave MLX's default. MLX hoards freed buffers in WIRED memory
+/// for reuse; at long context that hoard (~1.5 GB observed) eats the headroom
+/// the command buffer needs and contributes to OOM. Capping it (e.g. 512 MB)
+/// frees that headroom directly.
+pub var configured_cache_limit: u64 = 0;
+
 pub const GpuLimitResult = struct {
     previous_wired: usize,
     /// Wired limit actually applied (capped at the device working set).
@@ -336,6 +343,8 @@ pub const GpuLimitResult = struct {
     /// Soft memory ceiling applied (the configured target; may exceed the
     /// device working set — that excess is non-wired / pageable).
     memory_applied: usize,
+    /// Reclaimable-cache cap applied, or 0 when left at MLX's default.
+    cache_applied: usize,
 };
 
 /// Apply the GPU wired + memory limits. The WIRED limit (resident,
@@ -354,7 +363,13 @@ pub fn applyGpuLimit(device_recommended: usize) GpuLimitResult {
     _ = mlx_set_wired_limit(&old_wired, wired_target);
     var old_mem: usize = 0;
     _ = mlx_set_memory_limit(&old_mem, target);
-    return .{ .previous_wired = old_wired, .wired_applied = wired_target, .memory_applied = target };
+    var cache_applied: usize = 0;
+    if (configured_cache_limit > 0) {
+        cache_applied = @intCast(configured_cache_limit);
+        var old_cache: usize = 0;
+        _ = mlx_set_cache_limit(&old_cache, cache_applied);
+    }
+    return .{ .previous_wired = old_wired, .wired_applied = wired_target, .memory_applied = target, .cache_applied = cache_applied };
 }
 
 // ── Device info ──

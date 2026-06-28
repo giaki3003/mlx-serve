@@ -34,6 +34,10 @@ const log = @import("log.zig");
 
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
+
+/// Process-wide KV-quant scheme for the MTP head's own draft cache
+/// (`--mtp-kv-quant`). Default dense (f16). See `makeCache`.
+pub var mtp_kv_quant: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense;
 const Weights = model_mod.Weights;
 
 /// Default draft depth (tokens drafted per round). Measured on Qwen3.6-27B
@@ -106,11 +110,18 @@ pub const MtpModel = struct {
         self.mlp_down.deinit();
     }
 
-    /// A fresh single-layer KV cache for the MTP attention layer. Always
-    /// dense — the head's history is small and rollback must be exact.
+    /// A fresh single-layer KV cache for the MTP attention layer. Defaults to
+    /// dense f16, but `--mtp-kv-quant` can quantize it: the committed-history
+    /// draft KV spans the FULL prompt (1 layer, but ~4 KB/token f16 → ~240 MB
+    /// at 58k, ~780 MB at 190k), and quantizing (e.g. turbo4) cuts that ~4x.
+    /// Rollback stays exact — snapshot/restore copy the stored (quantized)
+    /// codes verbatim — and drafts are verified by the trunk, so the small
+    /// quant loss only costs a little acceptance, never correctness.
     pub fn makeCache(self: *const MtpModel, allocator: std.mem.Allocator) !KVCache {
         _ = self;
-        return KVCache.init(allocator, 1);
+        if (mtp_kv_quant.scheme == .off) return KVCache.init(allocator, 1);
+        // head_dim is observed lazily at first write, so 0 here is fine.
+        return KVCache.initWithConfigAndHeadDim(allocator, 1, mtp_kv_quant, 0);
     }
 
     /// Validate the head against the target trunk: dims must line up and the
