@@ -322,27 +322,39 @@ pub extern "c" fn mlx_reset_peak_memory() c_int;
 /// instead of clear-then-remeasure. Present in mlx-c >= 0.6.0 / MLX 0.31.2.
 pub extern "c" fn mlx_get_cache_memory(res: *usize) c_int;
 
-/// Process-wide GPU wired-limit override in bytes. `0` = use the device's
+/// Process-wide GPU memory ceiling in bytes (the soft allocation cap MLX uses
+/// to decide when to free cache). `0` = use the device's
 /// `max_recommended_working_set_size` (legacy behavior). Set once at startup
-/// from `--wired-limit`; read by `applyGpuLimit` (where the Metal limit is set)
-/// and by the server's admission-check ceiling so both agree.
+/// from `--wired-limit`; read by `applyGpuLimit` and by the server's
+/// admission-check ceiling so both agree.
 pub var configured_wired_limit: u64 = 0;
 
-pub const GpuLimitResult = struct { previous_wired: usize, applied: usize };
+pub const GpuLimitResult = struct {
+    previous_wired: usize,
+    /// Wired limit actually applied (capped at the device working set).
+    wired_applied: usize,
+    /// Soft memory ceiling applied (the configured target; may exceed the
+    /// device working set — that excess is non-wired / pageable).
+    memory_applied: usize,
+};
 
-/// Apply the GPU wired + memory limit, lifting Metal's default
-/// `recommendedMaxWorkingSetSize` wall so long-context prefill doesn't
-/// OOM-abort below physical RAM. Uses `configured_wired_limit` when set, else
-/// `device_recommended`. Caller logs the before→after (mlx.zig stays
-/// log-free). Setting both wired and memory limits to the same value matches
-/// ollama's MLX runner.
+/// Apply the GPU wired + memory limits. The WIRED limit (resident,
+/// non-evictable memory) CANNOT exceed the device's
+/// `recommendedMaxWorkingSetSize` — `mlx_set_wired_limit` throws otherwise — so
+/// it is capped there. The MEMORY limit (`mlx_set_memory_limit`, MLX's soft
+/// cache-eviction ceiling) has no such cap and IS the lever that lets active
+/// memory grow past the recommended working set on a unified-memory Mac (the
+/// over-cap part is simply non-wired / pageable). Uses `configured_wired_limit`
+/// when set, else `device_recommended`. Caller logs the result (mlx.zig stays
+/// log-free).
 pub fn applyGpuLimit(device_recommended: usize) GpuLimitResult {
     const target: usize = if (configured_wired_limit > 0) @intCast(configured_wired_limit) else device_recommended;
+    const wired_target: usize = @min(target, device_recommended);
     var old_wired: usize = 0;
-    _ = mlx_set_wired_limit(&old_wired, target);
+    _ = mlx_set_wired_limit(&old_wired, wired_target);
     var old_mem: usize = 0;
     _ = mlx_set_memory_limit(&old_mem, target);
-    return .{ .previous_wired = old_wired, .applied = target };
+    return .{ .previous_wired = old_wired, .wired_applied = wired_target, .memory_applied = target };
 }
 
 // ── Device info ──

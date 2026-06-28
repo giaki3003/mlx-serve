@@ -633,7 +633,7 @@ pub fn main(init: std.process.Init) !void {
         .explicit => wired_limit_value,
     };
     if (mlx.configured_wired_limit > 0) {
-        log.info("[args] wired-limit: {d:.1} GB (raising Metal working-set ceiling)\n", .{@as(f64, @floatFromInt(mlx.configured_wired_limit)) / 1_073_741_824.0});
+        log.info("[args] wired-limit: {d:.1} GB GPU memory ceiling (wired capped at the device working set; excess is pageable)\n", .{@as(f64, @floatFromInt(mlx.configured_wired_limit)) / 1_073_741_824.0});
     } else {
         log.info("[args] wired-limit: device default (recommended working set)\n", .{});
     }
@@ -881,7 +881,7 @@ pub fn main(init: std.process.Init) !void {
                 var max_rec: usize = 0;
                 if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") == 0 and max_rec > 0) {
                     const r = mlx.applyGpuLimit(max_rec);
-                    log.info("Wired+memory limit: {d} MB -> {d} MB\n", .{ r.previous_wired / (1024 * 1024), r.applied / (1024 * 1024) });
+                    log.info("GPU limit: wired {d}->{d} MB (device max {d} MB), memory ceiling {d} MB\n", .{ r.previous_wired / (1024 * 1024), r.wired_applied / (1024 * 1024), max_rec / (1024 * 1024), r.memory_applied / (1024 * 1024) });
                 }
                 _ = mlx.mlx_device_info_free(info);
             }
