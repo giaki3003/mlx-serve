@@ -1323,15 +1323,17 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
     // was billed 100k× working set when the real peak is one chunk's worth.
     const chunk: u64 = @min(seq, @as(u64, generate_mod.prefill_chunk_override));
     const working_bytes: u64 = 8 * chunk * @max(hidden, ffn) * 2;
-    // P0b: with a quantized KV cache in DENSE attention mode, every attention
-    // pass dequantizes the FULL resident KV to f16 — a large transient the
-    // stored (quantized) `kv_bytes` above don't capture, and the thing that
-    // tips long-context prefill into a hard Metal OOM-abort (Abort trap: 6, far
-    // worse than a clean 400). `fused` attn-mode reads the quant triples
-    // directly and has no such transient. Model the full-prompt f16
-    // materialization (both K and V) so we reject gracefully and steer the user
-    // to fused / a higher --wired-limit.
-    const dense_dequant_transient: u64 = if (kv_pair.isQuant() and !server_config.default_kv_attn_fused)
+    // PREFILL attention transient. Fused attention is DECODE-ONLY (prefill
+    // always uses flash SDPA over DEQUANTIZED K/V), so a quantized KV cache
+    // materializes the full f16 K/V per full-attn layer during the last chunk's
+    // attention — a multi-GB transient (≈2.4 GB at 73k over 8 layers held by
+    // the async-eval'd chunk graph) that `working_bytes` (MLP-only) ignores,
+    // and the thing that tips a cold long prefill past the wired cap into a hard
+    // Metal OOM (Abort trap: 6, far worse than a clean 400). Applies to ANY
+    // quantized cache — the `--kv-attn-mode fused` flag does NOT exclude it,
+    // because fused never runs at prefill (an earlier version wrongly gated this
+    // on it, so a fused run modelled ZERO prefill transient and OOM'd).
+    const dense_dequant_transient: u64 = if (kv_pair.isQuant())
         full_attn_layers * 2 * @as(u64, @intCast(prompt_len)) * kv_heads * hdim * 2
     else
         0;
@@ -1388,11 +1390,11 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         const needed_mb = needed / (1024 * 1024);
         const avail_mb = available / (1024 * 1024);
         log.warn("  prompt {d} tokens ({d} uncached after prefix cache) needs ~{d}MB (KV+working+margin), ~{d}MB available — rejecting\n", .{ prompt_len, prompt_len - resident_prefix, needed_mb, avail_mb });
-        // When the dense dequant transient dominates, the actionable fix is
-        // switching to fused (flat memory) or raising --wired-limit, not just
-        // a shorter prompt.
+        // When the prefill KV-dequant transient dominates, the levers are a
+        // higher --wired-limit, a shorter prompt, or a smaller model — NOT
+        // fused (it's decode-only; prefill always dequantizes).
         const hint: []const u8 = if (dense_dequant_transient > 0)
-            " The dense-mode KV dequant transient dominates — try --kv-attn-mode fused or a higher --wired-limit."
+            " The prefill KV-dequant transient dominates — raise --wired-limit, shorten the prompt, or use a smaller model."
         else
             " Reduce prompt size or use a smaller model.";
         const msg = try std.fmt.allocPrint(allocator,
