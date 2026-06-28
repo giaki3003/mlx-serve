@@ -1317,8 +1317,20 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
     // was billed 100k× working set when the real peak is one chunk's worth.
     const chunk: u64 = @min(seq, @as(u64, generate_mod.prefill_chunk_override));
     const working_bytes: u64 = 8 * chunk * @max(hidden, ffn) * 2;
+    // P0b: with a quantized KV cache in DENSE attention mode, every attention
+    // pass dequantizes the FULL resident KV to f16 — a large transient the
+    // stored (quantized) `kv_bytes` above don't capture, and the thing that
+    // tips long-context prefill into a hard Metal OOM-abort (Abort trap: 6, far
+    // worse than a clean 400). `fused` attn-mode reads the quant triples
+    // directly and has no such transient. Model the full-prompt f16
+    // materialization (both K and V) so we reject gracefully and steer the user
+    // to fused / a higher --wired-limit.
+    const dense_dequant_transient: u64 = if (kv_pair.isQuant() and !server_config.default_kv_attn_fused)
+        full_attn_layers * 2 * @as(u64, @intCast(prompt_len)) * kv_heads * hdim * 2
+    else
+        0;
     // Total estimate with 25% safety margin
-    const needed: u64 = (kv_bytes + ssm_state_bytes + working_bytes) * 5 / 4;
+    const needed: u64 = (kv_bytes + ssm_state_bytes + working_bytes + dense_dequant_transient) * 5 / 4;
 
     // Available = GPU working-set ceiling minus current usage (model weights,
     // resident hot-cache KV, etc.). Uses the same real Metal limit as the
@@ -1334,10 +1346,10 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
     const MB: u64 = 1024 * 1024;
     var peak_raw: usize = 0;
     _ = mlx.mlx_get_peak_memory(&peak_raw);
-    log.info("  [mem-check] limit={d}MB active={d}MB peak={d}MB avail={d}MB | prompt={d} resident={d} uncached={d} | full_attn_layers={d} kv={d}MB ssm={d}MB work={d}MB needed={d}MB\n", .{
+    log.info("  [mem-check] limit={d}MB active={d}MB peak={d}MB avail={d}MB | prompt={d} resident={d} uncached={d} | full_attn_layers={d} kv={d}MB ssm={d}MB work={d}MB dequant={d}MB needed={d}MB\n", .{
         total_limit / MB, active_mem / MB, @as(u64, @intCast(peak_raw)) / MB, available / MB,
         prompt_len, resident_prefix, prompt_len - resident_prefix,
-        full_attn_layers, kv_bytes / MB, ssm_state_bytes / MB, working_bytes / MB, needed / MB,
+        full_attn_layers, kv_bytes / MB, ssm_state_bytes / MB, working_bytes / MB, dense_dequant_transient / MB, needed / MB,
     });
 
     // MLX holds a reclaimable buffer cache that inflates active_memory. If we
@@ -1357,8 +1369,15 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         const needed_mb = needed / (1024 * 1024);
         const avail_mb = available / (1024 * 1024);
         log.warn("  prompt {d} tokens ({d} uncached after prefix cache) needs ~{d}MB (KV+working+margin), ~{d}MB available — rejecting\n", .{ prompt_len, prompt_len - resident_prefix, needed_mb, avail_mb });
+        // When the dense dequant transient dominates, the actionable fix is
+        // switching to fused (flat memory) or raising --wired-limit, not just
+        // a shorter prompt.
+        const hint: []const u8 = if (dense_dequant_transient > 0)
+            " The dense-mode KV dequant transient dominates — try --kv-attn-mode fused or a higher --wired-limit."
+        else
+            " Reduce prompt size or use a smaller model.";
         const msg = try std.fmt.allocPrint(allocator,
-            "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB available. Reduce prompt size or use a smaller model.", .{ prompt_len, needed_mb, avail_mb });
+            "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB available.{s}", .{ prompt_len, needed_mb, avail_mb, hint });
         defer allocator.free(msg);
         if (is_anthropic) {
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
