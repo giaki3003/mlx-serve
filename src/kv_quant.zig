@@ -738,7 +738,12 @@ fn tiledCausalAttention(
             try mlx.check(mlx.mlx_triu(&upper, ones2, (q0 - t0) + 1, s));
             var mask2 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(mask2);
-            try mlx.check(mlx.mlx_multiply(&mask2, upper, neg_inf, s));
+            // Additive mask: -inf where triu==1 (future), 0 where triu==0
+            // (visible). Do NOT do `upper * neg_inf` — `0.0 * -inf = NaN` poisons
+            // every VISIBLE cell, which the softmax then spreads to the whole row
+            // (the all-NaN output the PROD-block test caught). `where` keeps the
+            // visible cells exactly 0 and the masked cells exactly -inf.
+            try mlx.check(mlx.mlx_where(&mask2, upper, neg_inf, zero_arr, s));
             var sc5m = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(sc5m);
             try mlx.check(mlx.mlx_add(&sc5m, sc5, mask2, s));
@@ -1065,7 +1070,7 @@ test "quantizeAffine + dequantizeAffine round-trip at 4 bits" {
     var max_err: f32 = 0;
     for (orig, got) |o, g| {
         const e = @abs(o - g);
-        if (e > max_err) max_err = e;
+        if (std.math.isNan(e) or e > max_err) max_err = e;
     }
     // 4-bit affine on smooth data with group=64: empirical ceiling well under 0.05.
     try testing.expect(max_err < 0.05);
@@ -1094,7 +1099,7 @@ test "quantizeAffine + dequantizeAffine round-trip at 8 bits" {
     var max_err: f32 = 0;
     for (orig, got) |o, g| {
         const e = @abs(o - g);
-        if (e > max_err) max_err = e;
+        if (std.math.isNan(e) or e > max_err) max_err = e;
     }
     // 8-bit affine: ~256x finer steps than 4-bit; expect < 0.005 on smooth data.
     try testing.expect(max_err < 0.01);
@@ -1316,7 +1321,7 @@ test "mlx_quantized_matmul transpose=true matches dequant+matmul (4-bit, 4D)" {
     var max_ref: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
         const e = @abs(r - c);
-        if (e > max_err) max_err = e;
+        if (std.math.isNan(e) or e > max_err) max_err = e;
         if (@abs(r) > max_ref) max_ref = @abs(r);
     }
     // bf16 reductions inside qmm don't bit-match an explicit dequant +
@@ -1379,7 +1384,7 @@ test "mlx_quantized_matmul transpose=false matches dequant+matmul (4-bit, 4D)" {
     var max_err: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
         const e = @abs(r - c);
-        if (e > max_err) max_err = e;
+        if (std.math.isNan(e) or e > max_err) max_err = e;
     }
     try testing.expect(max_err < 0.05);
 }
@@ -1450,7 +1455,7 @@ test "quantAttention matches dense SDPA at 4-bit (decode, T_q=1)" {
     var max_err: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
         const e = @abs(r - c);
-        if (e > max_err) max_err = e;
+        if (std.math.isNan(e) or e > max_err) max_err = e;
     }
     // Matches the bf16 reduction tolerance used elsewhere in this file.
     try testing.expect(max_err < 0.05);
@@ -1519,7 +1524,7 @@ test "quantAttention causal mask matches dense SDPA (prefill, T_q=T_k=4)" {
     var max_err: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
         const e = @abs(r - c);
-        if (e > max_err) max_err = e;
+        if (std.math.isNan(e) or e > max_err) max_err = e;
     }
     try testing.expect(max_err < 0.05);
 }
@@ -1597,7 +1602,7 @@ test "fused-turbo quantAttention matches dense-turbo SDPA (decode, T_q=1)" {
     var max_err: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
         const e = @abs(r - c);
-        if (e > max_err) max_err = e;
+        if (std.math.isNan(e) or e > max_err) max_err = e;
     }
     try testing.expect(max_err < 0.05);
 }
@@ -1663,7 +1668,7 @@ test "fused-turbo quantAttention matches dense-turbo SDPA (causal, Rk != Rv)" {
     var max_err: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
         const e = @abs(r - c);
-        if (e > max_err) max_err = e;
+        if (std.math.isNan(e) or e > max_err) max_err = e;
     }
     try testing.expect(max_err < 0.05);
 }
@@ -1736,7 +1741,7 @@ test "asymmetric quantAttention: K affine-8 + V turbo-4 matches dense SDPA" {
     var max_err: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
         const e = @abs(r - c);
-        if (e > max_err) max_err = e;
+        if (std.math.isNan(e) or e > max_err) max_err = e;
     }
     try testing.expect(max_err < 0.05);
 }
@@ -1807,7 +1812,7 @@ test "quantAttention GQA (H_q=4,H_kv=2) affine matches dense SDPA (causal)" {
     var max_err: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
         const e = @abs(r - c);
-        if (e > max_err) max_err = e;
+        if (std.math.isNan(e) or e > max_err) max_err = e;
     }
     try testing.expect(max_err < 0.05);
 }
@@ -1875,7 +1880,7 @@ test "quantAttention GQA (H_q=4,H_kv=2) fused-turbo matches dense-turbo SDPA (ca
     var max_err: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
         const e = @abs(r - c);
-        if (e > max_err) max_err = e;
+        if (std.math.isNan(e) or e > max_err) max_err = e;
     }
     try testing.expect(max_err < 0.05);
 }
@@ -1949,7 +1954,7 @@ test "tiled fused: multi-block causal + partial tail + fully-masked row (affine)
     var max_err: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
         const e = @abs(r - c);
-        if (e > max_err) max_err = e;
+        if (std.math.isNan(e) or e > max_err) max_err = e;
     }
     try testing.expect(max_err < 0.05);
 }
@@ -2013,7 +2018,7 @@ test "tiled fused: block==1 (per-key) causal still matches dense SDPA (affine)" 
     var max_err: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
         const e = @abs(r - c);
-        if (e > max_err) max_err = e;
+        if (std.math.isNan(e) or e > max_err) max_err = e;
     }
     try testing.expect(max_err < 0.05);
 }
@@ -2083,7 +2088,7 @@ test "tiled fused: decode (T_q=1) multi-block GQA + turbo matches dense SDPA" {
     var max_err: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
         const e = @abs(r - c);
-        if (e > max_err) max_err = e;
+        if (std.math.isNan(e) or e > max_err) max_err = e;
     }
     try testing.expect(max_err < 0.05);
 }
@@ -2156,7 +2161,7 @@ test "tiled fused: warm continuation (T_q=3 << T_k=30) GQA causal matches dense 
     var max_err: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
         const e = @abs(r - c);
-        if (e > max_err) max_err = e;
+        if (std.math.isNan(e) or e > max_err) max_err = e;
     }
     try testing.expect(max_err < 0.05);
 }
@@ -2257,7 +2262,7 @@ test "tiled TURBO: K affine8 + V turbo4, T_q>1 multi-block causal matches dense 
     var max_err: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
         const e = @abs(r - c);
-        if (e > max_err) max_err = e;
+        if (std.math.isNan(e) or e > max_err) max_err = e;
     }
     try testing.expect(max_err < 0.05);
 }
@@ -2326,7 +2331,7 @@ test "tiled TURBO: K turbo4 + V turbo4 (Rk != Rv), T_q>1 multi-block causal matc
     var max_err: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
         const e = @abs(r - c);
-        if (e > max_err) max_err = e;
+        if (std.math.isNan(e) or e > max_err) max_err = e;
     }
     try testing.expect(max_err < 0.05);
 }
