@@ -14,6 +14,7 @@ const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
+const kv_quant_mod = @import("kv_quant.zig");
 const vision_mod = @import("vision.zig");
 const ds4_arch = @import("arch/ds4.zig");
 const llama_arch = @import("arch/llama.zig");
@@ -106,6 +107,10 @@ fn printUsage(io: std.Io) void {
         \\                        dense-dequant spike at long context). Prefill
         \\                        always uses flash SDPA. Effective at --kv-quant
         \\                        4, 8, turbo2 or turbo4.
+        \\  --kv-attn-block <n> K-tile size for the fused online-softmax
+        \\                        attention (default 4096). Bounds the attention
+        \\                        transient to O(block); smaller = flatter memory
+        \\                        but more dispatches.
         \\  --prefix-cache-mem <n>{{KB,MB,GB}}
         \\                      Hot prefix cache KV-bytes budget (default: 2GB).
         \\                      Evicts LRU entries until the budget fits.
@@ -496,6 +501,14 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--hot-cache-consume: expected 'on' or 'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             }
+        } else if (std.mem.eql(u8, args[i], "--kv-attn-block") and i + 1 < args.len) {
+            i += 1;
+            const n = std.fmt.parseInt(u32, args[i], 10) catch 0;
+            if (n == 0) {
+                log.err("--kv-attn-block: expected a positive integer (K-tile size); got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
+            kv_quant_mod.kv_attn_block = n;
         } else if (std.mem.eql(u8, args[i], "--idle-evict-secs") and i + 1 < args.len) {
             // Plan 05 Phase D: idle-tick eviction window. When set, the
             // inference loop's idle path evicts .ready entries (refcount==0)
