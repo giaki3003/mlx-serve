@@ -7,6 +7,34 @@ pub const KVQuantConfig = kv_quant.KVQuantConfig;
 pub const KVQuantPair = kv_quant.KVQuantPair;
 pub const KVQuantScheme = kv_quant.Scheme;
 
+// ── Per-component prefill profiler (opt-in: --prefill-profile / MLX_SERVE_PREFILL_PROFILE) ──
+// When on, forwardMoeWith forces an mlx eval after each layer's mixer and after
+// the rest of the layer, so the wall-clock timers capture real GPU time per
+// component: GDN (linear-attention mixer) vs ATTN (full-attention mixer) vs MLP
+// (FFN + norms + residuals). This SERIALIZES the layer pipeline, so the ABSOLUTE
+// prefill time is inflated — read the gdn/attn/mlp split as a RATIO, not a speed.
+// Default off (zero overhead). profReset() is called per request (generate.zig);
+// the totals print in [prefill-trace].
+pub var prefill_profile: bool = false;
+pub var prof_gdn_ns: u64 = 0;
+pub var prof_attn_ns: u64 = 0;
+pub var prof_mlp_ns: u64 = 0;
+
+pub fn profReset() void {
+    prof_gdn_ns = 0;
+    prof_attn_ns = 0;
+    prof_mlp_ns = 0;
+}
+
+inline fn profEval(arr: mlx.mlx_array) void {
+    mlx.check(mlx.mlx_array_eval(arr)) catch {};
+}
+
+inline fn profSince(t0: i128) u64 {
+    const d = std.time.nanoTimestamp() - t0;
+    return if (d > 0) @intCast(d) else 0;
+}
+
 // ── GatedDeltaNet fused Metal kernel ──
 // Ported from mlx-lm/models/gated_delta.py: `_make_gated_delta_kernel(has_mask=False, vectorized=False)`.
 // Processes the entire T-step delta recurrence in a single kernel dispatch, eliminating
@@ -4950,9 +4978,14 @@ pub const Transformer = struct {
             }
         }
 
+        // Profiler: materialize the embedding so layer-0's mixer timing is clean.
+        if (prefill_profile and is_prefill) profEval(h);
         for (0..cfg.num_hidden_layers) |layer_idx| {
             const li: u32 = @intCast(layer_idx);
             const lw = &ml[layer_idx];
+
+            const prof = prefill_profile and is_prefill;
+            const t_mix: i128 = if (prof) std.time.nanoTimestamp() else 0;
 
             const normed = try self.rmsNorm(h, lw.input_norm);
             defer _ = mlx.mlx_array_free(normed);
@@ -4966,6 +4999,16 @@ pub const Transformer = struct {
                     try self.gatedFullAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill),
             };
             defer _ = mlx.mlx_array_free(attn_out);
+
+            if (prof) {
+                profEval(attn_out);
+                const dt = profSince(t_mix);
+                switch (lw.attn) {
+                    .linear => prof_gdn_ns += dt,
+                    .full => prof_attn_ns += dt,
+                }
+            }
+            const t_mlp: i128 = if (prof) std.time.nanoTimestamp() else 0;
 
             if (is_gemma4) {
                 h = try self.gemma4MoeLayerTail(h, attn_out, lw, ctx.use_encoder_scalars);
@@ -4990,7 +5033,10 @@ pub const Transformer = struct {
                 h = h_next;
             }
 
-            if (is_prefill and (layer_idx + 1) % MOE_EVAL_EVERY_N_LAYERS == 0) {
+            if (prof) {
+                profEval(h);
+                prof_mlp_ns += profSince(t_mlp);
+            } else if (is_prefill and (layer_idx + 1) % MOE_EVAL_EVERY_N_LAYERS == 0) {
                 try mlx.check(mlx.mlx_array_eval(h));
             }
         }
@@ -10047,4 +10093,14 @@ fn gdnTestRunSeqAt(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_reshape(&out, sliced, &fshape, 4, s));
     return out;
+}
+
+test "profReset zeroes the prefill-profile accumulators" {
+    prof_gdn_ns = 123;
+    prof_attn_ns = 456;
+    prof_mlp_ns = 789;
+    profReset();
+    try std.testing.expectEqual(@as(u64, 0), prof_gdn_ns);
+    try std.testing.expectEqual(@as(u64, 0), prof_attn_ns);
+    try std.testing.expectEqual(@as(u64, 0), prof_mlp_ns);
 }

@@ -53,6 +53,24 @@ a CSV of cold + warm prefill tok/s parsed from this line. Override the sweep wit
 env vars (`PROMPT_SIZES`, `PREFILL_CHUNKS`, `SSM_STRIDES`, `MTP_MODES`,
 `COMPILE_FWD`, `PREFIX_CACHE`, `MAX_CONCURRENT`, `DECODE_TOKENS`, `EXTRA_FLAGS`).
 
+### Per-component split: `--prefill-profile`
+
+To find *where* prefill compute goes — the GatedDeltaNet mixers (24 layers), the
+full-attention mixers (8 layers), or the dense FFN — run with `--prefill-profile`
+(or `MLX_SERVE_PREFILL_PROFILE=1`). It emits a second line:
+
+```
+[prefill-profile] gdn=…ms (…%) attn=…ms (…%) mlp=…ms (…%) [serialized — ratio only]
+```
+
+It forces an `mlx_eval` after each layer's mixer and after the rest of the layer,
+so the timers capture real per-component GPU time. **This serializes the layer
+pipeline, so the total/`prefill_tps` in `[prefill-trace]` is inflated while
+profiling — read the percentages as a RATIO, not a speed.** Use it on a single
+request (benchmark), not under serving load. The split tells you whether a
+vectorized GDN kernel is worth it (gdn dominates) or whether you're at the FFN
+4-bit-matmul ceiling (mlp dominates, little room — MLX's qmm is already tuned).
+
 ## Tuning flags
 
 | Flag | Default | What it does |

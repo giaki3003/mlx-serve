@@ -762,8 +762,13 @@ pub const Generator = struct {
         // MLX_SERVE_PREFILL_TRACE=1 (which forces the trace line at info).
         // Phase 0 of plan 04 — gives us a decomposed view of where cold prefill
         // time goes (chunked-forward vs eval vs last-token-forward).
-        const trace_force: bool = prefill_trace_force or readEnvBool("MLX_SERVE_PREFILL_TRACE");
+        if (readEnvBool("MLX_SERVE_PREFILL_PROFILE")) transformer_mod.prefill_profile = true;
+        const trace_force: bool = prefill_trace_force or readEnvBool("MLX_SERVE_PREFILL_TRACE") or transformer_mod.prefill_profile;
         const trace_enabled = log.isDebug() or trace_force;
+        // Per-component prefill profiler (--prefill-profile / MLX_SERVE_PREFILL_PROFILE):
+        // reset the GDN/attn/MLP accumulators per request so the [prefill-profile]
+        // split is for this prompt.
+        if (transformer_mod.prefill_profile) transformer_mod.profReset();
         var prefill_sw = io_util.Stopwatch.init(io);
         var chunked_ns: u64 = 0;
         var eval_ns: u64 = 0;
@@ -1085,6 +1090,21 @@ pub const Generator = struct {
                     if (need_capture) " [capture-hidden]" else "",
                 },
             );
+            // Per-component split (--prefill-profile). NOTE: profiling serializes
+            // the layer pipeline (an eval per component), so total above is
+            // INFLATED — read these as a RATIO (where prefill compute goes), not
+            // as a speed. gdn = 24 GatedDeltaNet mixers, attn = 8 full-attention
+            // mixers, mlp = FFN + norms + residuals (all layers).
+            if (transformer_mod.prefill_profile) {
+                const g = transformer_mod.prof_gdn_ns / ms;
+                const a = transformer_mod.prof_attn_ns / ms;
+                const m = transformer_mod.prof_mlp_ns / ms;
+                const tot = @max(@as(u64, 1), g + a + m);
+                std.debug.print(
+                    "  [prefill-profile] gdn={d}ms ({d}%) attn={d}ms ({d}%) mlp={d}ms ({d}%) [serialized — ratio only]\n",
+                    .{ g, g * 100 / tot, a, a * 100 / tot, m, m * 100 / tot },
+                );
+            }
         }
         errdefer if (has_captured_hidden) {
             _ = mlx.mlx_array_free(captured_hidden);

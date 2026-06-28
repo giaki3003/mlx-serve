@@ -134,6 +134,11 @@ fn printUsage(io: std.Io) void {
         \\  --prefill-trace     Force the [prefill-trace] line at info level
         \\                        (chunks, eval/clear ms, compiled-forward status,
         \\                        MTP/PLD flags). Already on at --log-level debug.
+        \\  --prefill-profile   Per-component prefill split: [prefill-profile]
+        \\                        gdn/attn/mlp ms + %. Forces an eval per component
+        \\                        (serializes layers) so the TOTAL is inflated —
+        \\                        read it as a RATIO. Implies --prefill-trace;
+        \\                        single-request/benchmark use only.
         \\  --ssm-checkpoint-stride <n>
         \\                      Tokens between SSM/conv-state snapshots during
         \\                        hybrid (GatedDeltaNet/Mamba) prefill (default:
@@ -418,6 +423,14 @@ pub fn main(init: std.process.Init) !void {
             const v = std.fmt.parseInt(usize, args[i], 10) catch 8192;
             generate_mod.prefill_chunk_override = v;
         } else if (std.mem.eql(u8, args[i], "--prefill-trace")) {
+            generate_mod.prefill_trace_force = true;
+        } else if (std.mem.eql(u8, args[i], "--prefill-profile")) {
+            // Per-component prefill profiler: prints a [prefill-profile] line
+            // splitting prefill GPU time into GDN / full-attention / MLP. It
+            // forces an eval per component (serializes the pipeline), so the
+            // ABSOLUTE prefill time is inflated — read it as a RATIO. Implies
+            // --prefill-trace. Single-request use only (benchmark, not serving).
+            transformer_mod.prefill_profile = true;
             generate_mod.prefill_trace_force = true;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and i + 1 < args.len) {
             i += 1;
