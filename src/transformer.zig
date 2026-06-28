@@ -1928,13 +1928,16 @@ pub const ForwardCtx = struct {
     mrope_delta: i32 = 0,
     mrope_cos_cur: ?mlx.mlx_array = null,
     mrope_sin_cur: ?mlx.mlx_array = null,
-    /// Phase 2 (Plan ricky): when true, attention call sites consume the
+    /// Phase 2 (Plan ricky): when true, DECODE attention call sites consume the
     /// cache's quantized K/V triples directly via `kv_quant.quantAttention`
-    /// instead of dequantizing through `DenseKVView`. Effective for the affine
-    /// AND TurboQuant schemes — fused-turbo undoes the stored Hadamard rotation
-    /// inside `quantAttention` via the view's `k_rot`/`v_rot` matrices. `.off`
-    /// ignores the flag (no quant triple to consume).
-    /// Default false → unchanged dense SDPA path.
+    /// instead of dequantizing through `DenseKVView` — avoiding the dense-KV
+    /// dequant spike at long-context decode. Effective for the affine AND
+    /// TurboQuant schemes (fused-turbo undoes the stored Hadamard rotation via
+    /// the view's `k_rot`/`v_rot`). `.off` ignores it (no triple to consume).
+    /// PREFILL always uses flash SDPA regardless: the hand-rolled
+    /// qmm→softmax→qmm materializes the full [T_q, T_k] score matrix, which
+    /// flash never does, so fused prefill OOMs at long context. Default false →
+    /// unchanged dense SDPA path everywhere.
     kv_attn_fused: bool = false,
     /// Batched-embeddings: additive key-padding mask [B, 1, 1, T] consumed
     /// by the BERT encoder forward so padded positions never attend. Null
@@ -4307,12 +4310,15 @@ pub const Transformer = struct {
                 }
             }
 
-            // Fused-attn opt-in: consume the cache's quant triples directly
-            // via mlx_quantized_matmul. Only when the request opts in AND
-            // the cache scheme is .affine (TurboQuant variants need their
-            // rotation undo step, deferred). Falls back to dense SDPA on
-            // any precondition miss.
-            if (ctx.kv_attn_fused and kv_view.has_quant_triple) {
+            // Fused-attn opt-in (DECODE ONLY): consume the cache's quant
+            // triples directly via mlx_quantized_matmul, avoiding the dense-KV
+            // dequant spike at long-context decode. Gated to decode (T_q==1)
+            // because the hand-rolled qmm→softmax→qmm MATERIALIZES the full
+            // [T_q, T_k] score matrix, which flash SDPA (the dense path) never
+            // does — at prefill (T_q = chunk) that blows up across the
+            // async-eval'd layer graph and OOMs, while flash tiles it. Prefill
+            // and any precondition miss fall through to dense SDPA.
+            if (ctx.kv_attn_fused and kv_view.has_quant_triple and !is_prefill) {
                 const fused = try kv_quant.quantAttention(
                     q_rope,
                     kv_view.kTriple(),
@@ -6200,9 +6206,11 @@ pub const Transformer = struct {
         const none_mask = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(none_mask);
 
-        // Fused-attn opt-in: see standard attention site for design notes.
+        // Fused-attn opt-in (DECODE ONLY): see standard attention site for the
+        // rationale — fused qmm attention materializes the full score matrix,
+        // so prefill (T_q>1) uses flash SDPA below and only decode goes fused.
         const sel_mode_moe: []const u8 = if (is_prefill) "causal" else "";
-        if (ctx.kv_attn_fused and kv_view.has_quant_triple) {
+        if (ctx.kv_attn_fused and kv_view.has_quant_triple and !is_prefill) {
             const fused = try kv_quant.quantAttention(
                 q_rope,
                 kv_view.kTriple(),

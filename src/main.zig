@@ -101,8 +101,10 @@ fn printUsage(io: std.Io) void {
         \\                      Attention path for quantized KV. `dense`
         \\                        (default) dequantizes K/V before SDPA;
         \\                        `fused` consumes the quant triples directly
-        \\                        via mlx_quantized_matmul (opt-in; effective
-        \\                        at --kv-quant 4, 8, turbo2 or turbo4).
+        \\                        via mlx_quantized_matmul at DECODE (avoids the
+        \\                        dense-dequant spike at long context). Prefill
+        \\                        always uses flash SDPA. Effective at --kv-quant
+        \\                        4, 8, turbo2 or turbo4.
         \\  --prefix-cache-mem <n>{{KB,MB,GB}}
         \\                      Hot prefix cache KV-bytes budget (default: 2GB).
         \\                      Evicts LRU entries until the budget fits.
