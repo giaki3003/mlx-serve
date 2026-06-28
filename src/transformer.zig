@@ -46,6 +46,17 @@ inline fn profSince(t0: ?std.Io.Timestamp) u64 {
     return if (d > 0) @intCast(d) else 0;
 }
 
+// perf/m5 (opt-in, default OFF): use the value-vectorized GDN prefill kernel
+// (GDN_KERNEL_VEC_SOURCE). The scalar kernel gives every Dv output-dim its own
+// simdgroup, so q/k are re-read Dv× per step. The vectorized variant has each
+// thread carry gdn_vec_nv value-dims and load q/k ONCE per step, reused across
+// them — cutting the redundant q/k traffic ~NV×. Win only if GDN prefill is
+// bandwidth-bound on those reads (uncertain on M5); validate with the
+// gdn-vectorized-vs-scalar parity test, then A/B prefill tok/s. Default off so
+// decode/spec and the validated scalar path are untouched.
+pub var gdn_vectorized: bool = false;
+pub var gdn_vec_nv: u32 = 4;
+
 // ── GatedDeltaNet fused Metal kernel ──
 // Ported from mlx-lm/models/gated_delta.py: `_make_gated_delta_kernel(has_mask=False, vectorized=False)`.
 // Processes the entire T-step delta recurrence in a single kernel dispatch, eliminating
@@ -136,6 +147,114 @@ fn getGdnKernel() !mlx.mlx_fast_metal_kernel {
     );
     if (kernel.ctx == null) return error.MetalKernelCompileFailed;
     gdn_kernel_cached = kernel;
+    return kernel;
+}
+
+// Value-vectorized variant of GDN_KERNEL_SOURCE (perf/m5, opt-in). IDENTICAL
+// math, but each thread carries NV value-dims (state[NV][n_per_t]) and loads
+// each q/k element ONCE per step, reusing it across the NV dims — vs the scalar
+// kernel where Dv separate simdgroups each re-read q/k. Grid y becomes Dv/NV.
+// NV is a template int; Dv must be divisible by NV (checked at dispatch).
+const GDN_KERNEL_VEC_SOURCE =
+    \\auto n = thread_position_in_grid.z;
+    \\auto b_idx = n / Hv;
+    \\auto hv_idx = n % Hv;
+    \\auto hk_idx = hv_idx / (Hv / Hk);
+    \\constexpr int n_per_t = Dk / 32;
+    \\
+    \\auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+    \\auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+    \\
+    \\auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+    \\y += b_idx * T * Hv * Dv + hv_idx * Dv;
+    \\
+    \\auto dk_idx = thread_position_in_threadgroup.x;
+    \\auto dv_base = thread_position_in_grid.y * NV;
+    \\
+    \\float state[NV][n_per_t];
+    \\for (int j = 0; j < NV; ++j) {
+    \\  auto i_state = state_in + (n * Dv + dv_base + j) * Dk;
+    \\  for (int i = 0; i < n_per_t; ++i) {
+    \\    auto s_idx = n_per_t * dk_idx + i;
+    \\    state[j][i] = static_cast<float>(i_state[s_idx]);
+    \\  }
+    \\}
+    \\
+    \\auto g_ = g + b_idx * T * Hv;
+    \\auto beta_ = beta + b_idx * T * Hv;
+    \\
+    \\for (int t = 0; t < T; ++t) {
+    \\  float gg = g_[hv_idx];
+    \\  float bb = beta_[hv_idx];
+    \\  float kv_mem[NV];
+    \\  for (int j = 0; j < NV; ++j) { kv_mem[j] = 0.0f; }
+    \\  for (int i = 0; i < n_per_t; ++i) {
+    \\    auto s_idx = n_per_t * dk_idx + i;
+    \\    float kval = k_[s_idx];
+    \\    for (int j = 0; j < NV; ++j) {
+    \\      state[j][i] = state[j][i] * gg;
+    \\      kv_mem[j] += state[j][i] * kval;
+    \\    }
+    \\  }
+    \\  for (int j = 0; j < NV; ++j) { kv_mem[j] = simd_sum(kv_mem[j]); }
+    \\
+    \\  float delta[NV];
+    \\  for (int j = 0; j < NV; ++j) { delta[j] = (v_[dv_base + j] - kv_mem[j]) * bb; }
+    \\
+    \\  float out[NV];
+    \\  for (int j = 0; j < NV; ++j) { out[j] = 0.0f; }
+    \\  for (int i = 0; i < n_per_t; ++i) {
+    \\    auto s_idx = n_per_t * dk_idx + i;
+    \\    float kval = k_[s_idx];
+    \\    float qval = q_[s_idx];
+    \\    for (int j = 0; j < NV; ++j) {
+    \\      state[j][i] = state[j][i] + kval * delta[j];
+    \\      out[j] += state[j][i] * qval;
+    \\    }
+    \\  }
+    \\  for (int j = 0; j < NV; ++j) {
+    \\    out[j] = simd_sum(out[j]);
+    \\    if (thread_index_in_simdgroup == 0) {
+    \\      y[dv_base + j] = static_cast<InT>(out[j]);
+    \\    }
+    \\  }
+    \\  q_ += Hk * Dk;
+    \\  k_ += Hk * Dk;
+    \\  v_ += Hv * Dv;
+    \\  y += Hv * Dv;
+    \\  g_ += Hv;
+    \\  beta_ += Hv;
+    \\}
+    \\for (int j = 0; j < NV; ++j) {
+    \\  auto o_state = state_out + (n * Dv + dv_base + j) * Dk;
+    \\  for (int i = 0; i < n_per_t; ++i) {
+    \\    auto s_idx = n_per_t * dk_idx + i;
+    \\    o_state[s_idx] = static_cast<StT>(state[j][i]);
+    \\  }
+    \\}
+;
+
+var gdn_kernel_vec_cached: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getGdnKernelVec() !mlx.mlx_fast_metal_kernel {
+    if (gdn_kernel_vec_cached) |k| return k;
+    const input_names = [_][*:0]const u8{ "q", "k", "v", "g", "beta", "state_in", "T" };
+    const output_names = [_][*:0]const u8{ "y", "state_out" };
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "gated_delta_step_vec",
+        in_vec,
+        out_vec,
+        GDN_KERNEL_VEC_SOURCE,
+        "",
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    gdn_kernel_vec_cached = kernel;
     return kernel;
 }
 
@@ -6755,8 +6874,12 @@ pub const Transformer = struct {
         } else {
             const state_shape_out = [_]c_int{ batch, num_v_heads, dv, dk };
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &state_shape_out, 4, .bfloat16));
-            // Grid: (32, Dv, B*Hv) threads; threadgroup: (32, 4, 1). Matches mlx-lm.
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, dv, batch * num_v_heads));
+            // perf/m5: value-vectorized kernel when --gdn-vectorized AND Dv % NV == 0.
+            const gdn_nv: c_int = @intCast(gdn_vec_nv);
+            const gdn_use_vec = gdn_vectorized and gdn_nv > 1 and @rem(dv, gdn_nv) == 0;
+            // Grid: scalar = (32, Dv, B*Hv); vec = (32, Dv/NV, B*Hv). threadgroup (32,4,1).
+            const grid_y: c_int = if (gdn_use_vec) @divExact(dv, gdn_nv) else dv;
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, grid_y, batch * num_v_heads));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", .bfloat16));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", .bfloat16));
@@ -6764,12 +6887,13 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dv", dv));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hk", num_k_heads));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hv", num_v_heads));
+            if (gdn_use_vec) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NV", gdn_nv));
 
             const inputs_arr = [_]mlx.mlx_array{ q_scaled, k_scaled, v_heads, g, beta, ssm.ssm_state, T_scalar };
             const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
             defer _ = mlx.mlx_vector_array_free(inputs_vec);
 
-            const gdn_kernel = try getGdnKernel();
+            const gdn_kernel = if (gdn_use_vec) try getGdnKernelVec() else try getGdnKernel();
             var outputs_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(outputs_vec);
             try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, gdn_kernel, inputs_vec, config, self.s));
@@ -10114,4 +10238,156 @@ test "profReset zeroes the prefill-profile accumulators" {
     try std.testing.expectEqual(@as(u64, 0), prof_gdn_ns);
     try std.testing.expectEqual(@as(u64, 0), prof_attn_ns);
     try std.testing.expectEqual(@as(u64, 0), prof_mlp_ns);
+}
+
+// ── GDN vectorized-kernel parity test helpers (perf/m5) ──
+// Build a bf16 array of the given shape filled with deterministic pseudo-random
+// f32 in [lo,hi). Realized before the host buffer is freed.
+fn gdnTestArr(s: mlx.mlx_stream, alloc: std.mem.Allocator, shape: []const c_int, lo: f32, hi: f32, seed: u64) !mlx.mlx_array {
+    var n: usize = 1;
+    for (shape) |d| n *= @intCast(d);
+    const data = try alloc.alloc(f32, n);
+    defer alloc.free(data);
+    var x: u64 = seed *% 2862933555777941757 +% 3037000493;
+    for (data) |*d| {
+        x = x *% 6364136223846793005 +% 1442695040888963407;
+        const u: f32 = @as(f32, @floatFromInt((x >> 40) & 0xFFFFFF)) / 16777215.0;
+        d.* = lo + u * (hi - lo);
+    }
+    const f32arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+    defer _ = mlx.mlx_array_free(f32arr);
+    var bf = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(bf);
+    try mlx.check(mlx.mlx_astype(&bf, f32arr, .bfloat16, s));
+    try mlx.check(mlx.mlx_array_eval(bf)); // realize before `data` is freed
+    return bf;
+}
+
+fn gdnTestReadFlat(s: mlx.mlx_stream, arr: mlx.mlx_array, alloc: std.mem.Allocator) ![]f32 {
+    var f32v = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32v);
+    try mlx.check(mlx.mlx_astype(&f32v, arr, .float32, s));
+    const n: c_int = @intCast(mlx.mlx_array_size(f32v));
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    const sh = [_]c_int{n};
+    try mlx.check(mlx.mlx_reshape(&flat, f32v, &sh, 1, s));
+    try mlx.check(mlx.mlx_array_eval(flat));
+    const ptr = mlx.mlx_array_data_float32(flat) orelse return error.NullData;
+    const out = try alloc.alloc(f32, @intCast(n));
+    @memcpy(out, ptr[0..@intCast(n)]);
+    return out;
+}
+
+fn gdnTestDispatch(
+    s: mlx.mlx_stream,
+    kernel: mlx.mlx_fast_metal_kernel,
+    q: mlx.mlx_array,
+    k: mlx.mlx_array,
+    v: mlx.mlx_array,
+    g: mlx.mlx_array,
+    beta: mlx.mlx_array,
+    state: mlx.mlx_array,
+    B: c_int,
+    T: c_int,
+    Hk: c_int,
+    Hv: c_int,
+    Dk: c_int,
+    Dv: c_int,
+    nv: c_int, // 0 = scalar kernel, >0 = vectorized with this NV
+    y_out: *mlx.mlx_array,
+    state_out: *mlx.mlx_array,
+) !void {
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    const y_shape = [_]c_int{ B, T, Hv, Dv };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 4, .bfloat16));
+    const st_shape = [_]c_int{ B, Hv, Dv, Dk };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &st_shape, 4, .bfloat16));
+    const grid_y: c_int = if (nv > 0) @divExact(Dv, nv) else Dv;
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, grid_y, B * Hv));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dk", Dk));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dv", Dv));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hk", Hk));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hv", Hv));
+    if (nv > 0) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NV", nv));
+    const T_scalar = mlx.mlx_array_new_int(T);
+    defer _ = mlx.mlx_array_free(T_scalar);
+    const inputs_arr = [_]mlx.mlx_array{ q, k, v, g, beta, state, T_scalar };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 2) return error.MetalKernelBadOutputCount;
+    try mlx.check(mlx.mlx_vector_array_get(y_out, outputs_vec, 0));
+    try mlx.check(mlx.mlx_vector_array_get(state_out, outputs_vec, 1));
+}
+
+test "GDN value-vectorized kernel matches the scalar kernel (parity)" {
+    var metal_ok: bool = false;
+    _ = mlx.mlx_metal_is_available(&metal_ok);
+    if (!metal_ok) return error.SkipZigTest; // no Metal (CI/Linux) — skip
+
+    const s = mlx.gpuStream();
+    const alloc = std.testing.allocator;
+    const B: c_int = 1;
+    const T: c_int = 8;
+    const Hk: c_int = 1;
+    const Hv: c_int = 2;
+    const Dk: c_int = 64; // %32 == 0
+    const Dv: c_int = 16; // %NV == 0
+    const NV: c_int = 4;
+
+    const q = try gdnTestArr(s, alloc, &[_]c_int{ B, T, Hk, Dk }, -1.0, 1.0, 1);
+    defer _ = mlx.mlx_array_free(q);
+    const k = try gdnTestArr(s, alloc, &[_]c_int{ B, T, Hk, Dk }, -1.0, 1.0, 2);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try gdnTestArr(s, alloc, &[_]c_int{ B, T, Hv, Dv }, -1.0, 1.0, 3);
+    defer _ = mlx.mlx_array_free(v);
+    const g = try gdnTestArr(s, alloc, &[_]c_int{ B, T, Hv }, 0.10, 0.95, 4);
+    defer _ = mlx.mlx_array_free(g);
+    const beta = try gdnTestArr(s, alloc, &[_]c_int{ B, T, Hv }, 0.10, 0.95, 5);
+    defer _ = mlx.mlx_array_free(beta);
+    const state = try gdnTestArr(s, alloc, &[_]c_int{ B, Hv, Dv, Dk }, -0.1, 0.1, 6);
+    defer _ = mlx.mlx_array_free(state);
+
+    var y0 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y0);
+    var s0 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(s0);
+    try gdnTestDispatch(s, try getGdnKernel(), q, k, v, g, beta, state, B, T, Hk, Hv, Dk, Dv, 0, &y0, &s0);
+
+    var y1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y1);
+    var s1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(s1);
+    try gdnTestDispatch(s, try getGdnKernelVec(), q, k, v, g, beta, state, B, T, Hk, Hv, Dk, Dv, NV, &y1, &s1);
+
+    const y0f = try gdnTestReadFlat(s, y0, alloc);
+    defer alloc.free(y0f);
+    const y1f = try gdnTestReadFlat(s, y1, alloc);
+    defer alloc.free(y1f);
+    try std.testing.expectEqual(y0f.len, y1f.len);
+    var y_max: f32 = 0;
+    for (y0f, y1f) |a, b| {
+        const e = @abs(a - b);
+        if (e > y_max) y_max = e;
+    }
+    try std.testing.expect(y_max < 2e-2);
+
+    const s0f = try gdnTestReadFlat(s, s0, alloc);
+    defer alloc.free(s0f);
+    const s1f = try gdnTestReadFlat(s, s1, alloc);
+    defer alloc.free(s1f);
+    try std.testing.expectEqual(s0f.len, s1f.len);
+    var s_max: f32 = 0;
+    for (s0f, s1f) |a, b| {
+        const e = @abs(a - b);
+        if (e > s_max) s_max = e;
+    }
+    try std.testing.expect(s_max < 2e-2);
 }

@@ -187,6 +187,30 @@ state crosses Q-blocks) — deferred; coordinate with the teammate who owns this
 - **Default stays OFF** so it composes with the in-flight teammate work; if the
   A/B shows a win, the durable fix is the Q-tile loop, not this flag.
 
+### `--gdn-vectorized` — value-vectorized GatedDeltaNet prefill kernel
+
+The `--prefill-profile` split showed GatedDeltaNet is ~27% of prefill, and it
+runs on the **scalar** lanes (no matrix engine), not the FFN's `qmm_nax`. The
+scalar GDN kernel gives every `Dv` output-dim its own simdgroup, so each step
+**re-reads q/k `Dv`× over**. `--gdn-vectorized` (opt-in, default OFF) swaps in a
+kernel where each thread carries `--gdn-vec-nv` value-dims (default 4) and loads
+each q/k element **once** per step, reusing it across them — cutting that
+redundant traffic ~NV×. Prefill-only (T>1); decode and spec-decode keep the
+scalar kernel. **Uncertain payoff** (~1.2× *if* GDN prefill is bandwidth-bound on
+those reads — the q/k may already be L2-resident, in which case it's a wash).
+
+mlx-lm has **no** chunked-matmul GDN to port (its `gated_delta_ops` is a
+sequential per-token loop, and its kernel is the same scalar one); the
+chunked-matmul form's per-head matmuls are too small (`~128×128`) to feed the
+matrix engine well, so this q/k-reuse kernel — not chunking — is the lever.
+
+- **Validate first:** `zig build test` → "GDN value-vectorized kernel matches the
+  scalar kernel (parity)" compares both kernels' `y` + state on random inputs.
+  Then A/B prefill tok/s with `--gdn-vectorized` on vs off (try `--gdn-vec-nv 4`
+  and `8`). The `[prefill-profile]` `gdn` ms before/after shows the real effect.
+- A Metal compile error surfaces as `error.MetalKernelCompileFailed` at first use
+  (the Zig still builds — the kernel source compiles at runtime).
+
 ### Deprioritized by the on-device sweep (June 2026, Ornith-9B, 16 GB)
 
 A sweep (`bench_ornith.sh`) showed prefill is **compute-bound**: chunk size moved

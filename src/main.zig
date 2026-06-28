@@ -139,6 +139,13 @@ fn printUsage(io: std.Io) void {
         \\                        (serializes layers) so the TOTAL is inflated —
         \\                        read it as a RATIO. Implies --prefill-trace;
         \\                        single-request/benchmark use only.
+        \\  --gdn-vectorized    Opt-in: value-vectorized GatedDeltaNet PREFILL
+        \\                        kernel (load q/k once per step, reuse across
+        \\                        --gdn-vec-nv value-dims). Prefill-only; decode +
+        \\                        spec-decode use the scalar kernel. Validate with
+        \\                        the gdn-vectorized parity test, then A/B.
+        \\  --gdn-vec-nv <n>    Value-dims per thread for --gdn-vectorized
+        \\                        (default 4; Dv must be divisible by it).
         \\  --ssm-checkpoint-stride <n>
         \\                      Tokens between SSM/conv-state snapshots during
         \\                        hybrid (GatedDeltaNet/Mamba) prefill (default:
@@ -432,6 +439,15 @@ pub fn main(init: std.process.Init) !void {
             // --prefill-trace. Single-request use only (benchmark, not serving).
             transformer_mod.prefill_profile = true;
             generate_mod.prefill_trace_force = true;
+        } else if (std.mem.eql(u8, args[i], "--gdn-vectorized")) {
+            // perf/m5 (opt-in): value-vectorized GatedDeltaNet prefill kernel
+            // (load q/k once per step, reuse across gdn-vec-nv value-dims). Only
+            // affects prefill (T>1) on hybrid GDN models; decode/spec unchanged.
+            // Validate with the gdn-vectorized parity test first, then A/B.
+            transformer_mod.gdn_vectorized = true;
+        } else if (std.mem.eql(u8, args[i], "--gdn-vec-nv") and i + 1 < args.len) {
+            i += 1;
+            transformer_mod.gdn_vec_nv = std.fmt.parseInt(u32, args[i], 10) catch 4;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and i + 1 < args.len) {
             i += 1;
             server_mod.prefix_cache_capacity = std.fmt.parseInt(u32, args[i], 10) catch 1;
