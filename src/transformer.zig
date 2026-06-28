@@ -4317,9 +4317,18 @@ pub const Transformer = struct {
             // per-block scores tile is [B, H_q, T_q, block], and at prefill
             // (T_q = chunk) the un-tiled QUERY axis makes that multi-GB per
             // layer across the async-eval'd graph. Decode (T_q==1) is tiny and
-            // context-flat — the intended win. Prefill and any precondition
-            // miss fall through to dense flash SDPA, which tiles both axes.
-            if (ctx.kv_attn_fused and kv_view.has_quant_triple and !is_prefill) {
+            // context-flat — the intended win, so the default gate is decode-only.
+            //
+            // perf/m5 caveat: the dense fall-through is only "flash, tiles both
+            // axes" for head_dim in {64,80,128}. For LARGE head_dim (Qwen3.5=256)
+            // MLX's fused SDPA is unsupported, so dense PREFILL is UNFUSED and
+            // materializes the full [H_q, chunk, kv] scores (chunk·kv) — bigger
+            // than K-tiling's chunk·block at long ctx. So the opt-in
+            // --kv-attn-prefill-tiled (kv_quant.prefill_tiled) lets you MEASURE
+            // whether routing prefill here wins for 256-head models; keep
+            // --prefill-chunk moderate (query axis still untiled). The fully flat
+            // fix is a Q-tile loop wrapping tiledCausalAttention (deferred).
+            if (ctx.kv_attn_fused and kv_view.has_quant_triple and (!is_prefill or kv_quant.prefill_tiled)) {
                 const fused = try kv_quant.quantAttention(
                     q_rope,
                     kv_view.kTriple(),
@@ -6217,7 +6226,7 @@ pub const Transformer = struct {
         // which tiles BOTH axes in-kernel over the (small, bounded) dequantized
         // K/V. Flipping this to fused at prefill needs a Q-tile loop too.
         const sel_mode_moe: []const u8 = if (is_prefill) "causal" else "";
-        if (ctx.kv_attn_fused and kv_view.has_quant_triple and !is_prefill) {
+        if (ctx.kv_attn_fused and kv_view.has_quant_triple and (!is_prefill or kv_quant.prefill_tiled)) {
             const fused = try kv_quant.quantAttention(
                 q_rope,
                 kv_view.kTriple(),

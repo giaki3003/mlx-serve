@@ -520,6 +520,25 @@ pub const BorrowedTriple = struct {
 /// not pair a large value with a large `--prefill-chunk`.
 pub var kv_attn_block: u32 = 4096;
 
+/// perf/m5 (opt-in, default OFF): route PREFILL through the K-tiled
+/// online-softmax `tiledCausalAttention` too, not just decode. The fused-quant
+/// attention is gated to decode-only by default (`!is_prefill` at the SDPA call
+/// sites) pending on-device parity sign-off. Setting this (via
+/// `--kv-attn-prefill-tiled`) lets prefill use the flash-2 path NOW — the real
+/// win for large-head-dim models (e.g. Qwen3.5 head_dim 256), whose prefill
+/// otherwise dequantizes to dense and hits MLX's unfused SDPA fallback
+/// (head_dim 256 is NOT in MLX's fused set {64,80,128}), materializing the full
+/// `chunk·kv` score matrix and forcing tiny `--prefill-chunk`. K-tiling makes the
+/// prefill transient `chunk·block` instead (per-block scores `[H_q,chunk,block]`)
+/// — smaller than dense-unfused at long context (block≪kv), BUT the QUERY axis
+/// (chunk) is still untiled (see commit dd1a7d0), so keep `--prefill-chunk`
+/// moderate; the fully flat fix is a Q-tile loop (deferred). This flag exists to
+/// MEASURE the win on-device — validate with the tiled-vs-dense parity tests
+/// (incl. the head_dim-256 case) and an A/B of prefill tok/s + peak memory first.
+/// Default off so it composes with the teammate work that will replace the
+/// `!is_prefill` gate (with a Q-tile loop) once parity passes on-device.
+pub var prefill_tiled: bool = false;
+
 /// Slice a `[B, H, T, X]` array to `[B, H, t0:t1, X]` along the sequence axis.
 /// Caller owns the result. (The K/V quant triples are already strided cache
 /// views; `mlx_quantized_matmul` consumes a further slice fine.)
@@ -1809,6 +1828,76 @@ test "tiled fused: multi-block causal + partial tail + fully-masked row (affine)
     const T_q: c_int = 4;
     const T_k: c_int = 10;
     const D: c_int = 64;
+    const q = try buildSmoothBHTD(s, B, H, T_q, D);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = try buildSmoothBHTD(s, B, H, T_k, D);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = try buildSmoothBHTD(s, B, H, T_k, D);
+    defer _ = mlx.mlx_array_free(v_dense);
+
+    var qk = try quantizeAffine(s, k_dense, 64, 4);
+    defer qk.deinit();
+    var qv = try quantizeAffine(s, v_dense, 64, 4);
+    defer qv.deinit();
+    const k_ref = try dequantizeAffine(s, qk.q, qk.scales, qk.biases, 64, 4);
+    defer _ = mlx.mlx_array_free(k_ref);
+    const v_ref = try dequantizeAffine(s, qv.q, qv.scales, qv.biases, 64, 4);
+    defer _ = mlx.mlx_array_free(v_ref);
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    var ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref);
+    const none_mask = mlx.mlx_array{ .ctx = null };
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(
+        &ref, q, k_ref, v_ref, scale, "causal", none_mask, .{ .ctx = null }, s,
+    ));
+
+    const cand = try quantAttention(
+        q,
+        .{ .q = qk.q, .scales = qk.scales, .biases = qk.biases },
+        .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
+        4,
+        64,
+        4,
+        64,
+        .{ .ctx = null },
+        .{ .ctx = null },
+        scale,
+        "causal",
+        none_mask,
+        s,
+    );
+    defer _ = mlx.mlx_array_free(cand);
+
+    const ref_flat = try readF32Flat(s, ref, testing.allocator);
+    defer testing.allocator.free(ref_flat);
+    const cand_flat = try readF32Flat(s, cand, testing.allocator);
+    defer testing.allocator.free(cand_flat);
+    try testing.expectEqual(ref_flat.len, cand_flat.len);
+    var max_err: f32 = 0;
+    for (ref_flat, cand_flat) |r, c| {
+        const e = @abs(r - c);
+        if (e > max_err) max_err = e;
+    }
+    try testing.expect(max_err < 0.05);
+}
+
+test "tiled fused: head_dim 256 multi-block causal matches dense SDPA (affine, prefill-shaped)" {
+    // Pins the head dim that --kv-attn-prefill-tiled exists for: Qwen3.5 uses
+    // head_dim 256, which MLX's FUSED SDPA does not support for prefill (seq>1;
+    // its set is {64,80,128}). So the dense reference here runs MLX's UNFUSED
+    // fallback — still the correct result to validate the tiled path, which is
+    // exactly what we route prefill through. T_q>1 makes it prefill-shaped.
+    const s = mlx.gpuStream();
+    const saved = kv_attn_block;
+    kv_attn_block = 4; // force multi-block walk over T_k=10
+    defer kv_attn_block = saved;
+
+    const B: c_int = 1;
+    const H: c_int = 2;
+    const T_q: c_int = 4;
+    const T_k: c_int = 10;
+    const D: c_int = 256;
     const q = try buildSmoothBHTD(s, B, H, T_q, D);
     defer _ = mlx.mlx_array_free(q);
     const k_dense = try buildSmoothBHTD(s, B, H, T_k, D);

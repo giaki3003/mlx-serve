@@ -130,4 +130,52 @@ defaults").
 
 <!-- Updated as each staged commit lands on perf/m5-prefill-optimizations. -->
 
-- _(staged flags are documented here as they land)_
+### `--kv-attn-prefill-tiled` — head_dim-256 prefill experiment (needs on-device A/B)
+
+**The finding.** MLX 0.32's *fused* attention kernel is only built for head_dim
+∈ {64, 80, 128} (`steel_attention.metal`), and `use_fallback` hardcodes the same
+set for the prefill path (`scaled_dot_product_attention.cpp:626-633`). Qwen3.5
+(Ornith) uses **head_dim 256**, so **dense prefill attention falls to MLX's
+unfused SDPA** (transformer.zig calls `mlx_fast_scaled_dot_product_attention`),
+which materializes the full `[H_q, chunk, kv]` score matrix — slow, and the reason
+you must keep `--prefill-chunk` tiny (small chunks bound that `chunk·kv`
+transient). Decode (seq≤8) at 256 *is* fused. This — not chunking (~5%) or MTP
+(~1–2%) — is the real prefill ceiling on this model.
+
+**Two candidate fixes, one open question.** `tiledCausalAttention` (the K-tiled
+flash-2 loop in `quantAttention`) avoids the full score matrix, but it **only
+tiles the KEY axis** — the per-block scores are `[H_q, chunk, block]`, so the
+QUERY axis (`chunk`) stays untiled (see commit `dd1a7d0`). So:
+- vs dense at head_dim 256 (which is **unfused**, `chunk·kv`): K-tiling is
+  `chunk·block`, **smaller at long context** (block≪kv) — likely a win for the
+  190k regime, *if* you keep `--prefill-chunk` moderate.
+- the teammate's `dd1a7d0` note assumes the dense path is flash-tiled (~245 MB);
+  that holds for head_dim {64,80,128} but **not 256**, so for *this* model the
+  comparison favors K-tiling more than that note implies. **This is the open
+  question to settle empirically.**
+
+`--kv-attn-prefill-tiled` (opt-in, default OFF) routes prefill through the K-tiled
+path so you can **measure** it. The fully flat fix (any chunk size) is a **Q-tile
+loop** wrapping `tiledCausalAttention` (each query block independent; no softmax
+state crosses Q-blocks) — deferred; coordinate with the teammate who owns this code.
+
+- **Requires:** `--kv-attn-mode fused` + a quantized KV (`-ctk/-ctv` / `--kv-quant`).
+- **Keep `--prefill-chunk` moderate** (e.g. 1024–2048) — the query axis is untiled,
+  so a huge chunk makes the `chunk·block` tile large.
+- **Validate first:** `zig build test` — the `tiled fused: …` parity tests compare
+  the tiled path to dense SDPA, including the new **head_dim-256**, prefill-shaped
+  (T_q>1) multi-block case. Then A/B prefill tok/s AND peak memory with the flag
+  on vs off at your real ctx — that's what decides whether this helps for 256.
+- **Default stays OFF** so it composes with the in-flight teammate work; if the
+  A/B shows a win, the durable fix is the Q-tile loop, not this flag.
+
+### Deprioritized by the on-device sweep (June 2026, Ornith-9B, 16 GB)
+
+A sweep (`bench_ornith.sh`) showed prefill is **compute-bound**: chunk size moved
+throughput ~5% (and only when `--prefill-chunk` *and* `--ssm-checkpoint-stride`
+are raised together — the effective chunk is their min), MTP on/off ~1–2%, and
+per-chunk `clear_cache` ~0.3% of total. So the earlier staged orchestration
+patches (drop per-chunk clear_cache, MTP-lazy-history, async prefill eval,
+adaptive SSM stride, compiled-forward single-slot) are **not worth their
+risk/complexity for this model** and are shelved. The real lever is
+`--kv-attn-prefill-tiled` above (attention compute), not orchestration.

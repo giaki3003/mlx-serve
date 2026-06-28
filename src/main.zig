@@ -111,6 +111,13 @@ fn printUsage(io: std.Io) void {
         \\                        attention (default 4096). Bounds the attention
         \\                        transient to O(block); smaller = flatter memory
         \\                        but more dispatches.
+        \\  --kv-attn-prefill-tiled
+        \\                      Opt-in: route PREFILL through the K-tiled flash-2
+        \\                        attention too (default: decode only). Big win for
+        \\                        large head_dim (Qwen3.5 head_dim 256) whose
+        \\                        prefill otherwise falls to MLX's unfused SDPA.
+        \\                        Needs --kv-attn-mode fused + quantized KV; lets
+        \\                        you raise --prefill-chunk. Validate parity first.
         \\  --prefix-cache-mem <n>{{KB,MB,GB}}
         \\                      Hot prefix cache KV-bytes budget (default: 2GB).
         \\                      Evicts LRU entries until the budget fits.
@@ -557,6 +564,15 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             kv_quant_mod.kv_attn_block = n;
+        } else if (std.mem.eql(u8, args[i], "--kv-attn-prefill-tiled")) {
+            // perf/m5 (opt-in): route PREFILL through the K-tiled flash-2
+            // attention (not just decode). Big win for large head_dim (Qwen3.5
+            // head_dim 256), whose prefill otherwise hits MLX's unfused SDPA
+            // fallback (256 is not in MLX's fused set {64,80,128}) and
+            // materializes the score matrix. Requires --kv-attn-mode fused +
+            // a quantized KV. Default off; validate with the tiled-vs-dense
+            // parity tests (incl. head_dim 256) first.
+            kv_quant_mod.prefill_tiled = true;
         } else if (std.mem.eql(u8, args[i], "--idle-evict-secs") and i + 1 < args.len) {
             // Plan 05 Phase D: idle-tick eviction window. When set, the
             // inference loop's idle path evicts .ready entries (refcount==0)
