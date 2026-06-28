@@ -122,7 +122,7 @@ pub const LoadParams = struct {
     /// KV-cache storage backend. Defaults to dense bf16; user opts into
     /// 4/8-bit affine quantization via `--kv-quant {4,8}`. Stored on every
     /// per-slot KVCache and consulted at every read/write boundary.
-    kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
+    kv_quant_config: transformer_mod.KVQuantPair = transformer_mod.KVQuantPair.dense,
     /// Per-model hot prefix cache capacity (count). 0 disables.
     prefix_cache_capacity: u32 = 1,
     /// Per-model hot prefix cache KV-bytes budget. 0 disables the byte cap.
@@ -217,8 +217,10 @@ pub const SubmitParams = struct {
     /// scheme. When non-null, this slot's KVCache is constructed with this
     /// config instead of `Scheduler.kv_quant_config`. Lets one server host a
     /// single model and let clients trade accuracy for context length on a
-    /// per-call basis (`{"kv_quant": "off"|4|8}` body field).
-    kv_quant_config: ?transformer_mod.KVQuantConfig = null,
+    /// per-call basis. Body field accepts a scalar (`{"kv_quant": "off"|4|8|
+    /// "turbo4"}`, applied to both sides) or a per-side object
+    /// (`{"kv_quant": {"k": "8", "v": "turbo4"}}`).
+    kv_quant_config: ?transformer_mod.KVQuantPair = null,
     /// Plan 05 Phase D: the target model for this request. The conn thread
     /// resolves this via `scheduler.ensureLoaded(id)` BEFORE submitting and
     /// keeps a refcount on it for the slot's lifetime, so the model can't
@@ -374,7 +376,7 @@ pub const Slot = struct {
         io: std.Io,
         config: *const ModelConfig,
         params: SubmitParams,
-        kv_quant_config: transformer_mod.KVQuantConfig,
+        kv_quant_config: transformer_mod.KVQuantPair,
     ) !*Slot {
         const slot = try allocator.create(Slot);
         errdefer allocator.destroy(slot);
@@ -391,7 +393,7 @@ pub const Slot = struct {
         // slots the engine owns its own cache — we initialize a zero-layer
         // shell so `Slot.deinit` is symmetric with the MLX path.
         const slot_kv_layers: u32 = if (is_embedded) 0 else config.num_hidden_layers;
-        var cache = try KVCache.initWithConfigAndHeadDim(allocator, slot_kv_layers, kv_quant_config, config.head_dim);
+        var cache = try KVCache.initWithKVConfigs(allocator, slot_kv_layers, kv_quant_config.k, kv_quant_config.v, config.head_dim);
         errdefer cache.deinit();
 
         // Per-slot SSM cache. Mirror the same predicate `Transformer.init`
@@ -792,7 +794,7 @@ pub const LoadRequest = struct {
     warmup_eager: bool = true,
     draft_block_size: u32 = 4,
     draft_block_size_explicit: bool = false,
-    kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
+    kv_quant_config: transformer_mod.KVQuantPair = transformer_mod.KVQuantPair.dense,
     prefix_cache_capacity: u32 = 1,
     prefix_cache_mem_bytes: u64 = 0,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
@@ -870,7 +872,7 @@ pub const Scheduler = struct {
     vision_encoder: ?*VisionEncoder,
     drafter: ?*DrafterModel,
     drafter_block_size: u32,
-    kv_quant_config: transformer_mod.KVQuantConfig,
+    kv_quant_config: transformer_mod.KVQuantPair,
 
     // ── Borrowed refs (CPU-only state owned by the LoadedModel). ──
     config: *const ModelConfig,
@@ -1907,9 +1909,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // caches in serve mode honor this independently in `Slot.init`; this
     // call covers any path that still touches `xfm.cache` directly (legacy
     // single-slot fallbacks, prompt-cache reuse).
-    if (params.kv_quant_config.scheme != .off) {
+    if (params.kv_quant_config.isQuant()) {
         xfm_ptr.cache.deinit();
-        xfm_ptr.cache = try KVCache.initWithConfigAndHeadDim(sch.allocator, params.config.num_hidden_layers, params.kv_quant_config, params.config.head_dim);
+        xfm_ptr.cache = try KVCache.initWithKVConfigs(sch.allocator, params.config.num_hidden_layers, params.kv_quant_config.k, params.kv_quant_config.v, params.config.head_dim);
     }
 
     // Wire model weights into GPU memory (prevents paging, matches mlx-lm).

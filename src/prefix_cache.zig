@@ -60,12 +60,13 @@ const Entry = struct {
     /// lookup so per-request `kv_quant` overrides never produce a hit
     /// against an entry that was committed under another config.
     ///
-    /// Storing the full `KVQuantConfig` (not just `Scheme`) is what
-    /// distinguishes `affine 4` from `affine 8` and a future TurboQuant
-    /// `group_size` change — without that, a 4-bit entry would alias to an
-    /// 8-bit slot's findBestMatch lookup and crash SDPA with a packed-shape
-    /// mismatch on restore. Repro: `tests/test_kv_quant_per_request.sh`.
-    quant_config: kv_quant.KVQuantConfig,
+    /// Storing the full per-side `KVQuantPair` (not just `Scheme`) is what
+    /// distinguishes `affine 4` from `affine 8`, a TurboQuant `group_size`
+    /// change, AND an asymmetric `K affine-8 / V turbo-4` layout from a
+    /// symmetric one — without that, a 4-bit entry would alias to an 8-bit
+    /// slot's findBestMatch lookup and crash SDPA with a packed-shape mismatch
+    /// on restore. Repro: `tests/test_kv_quant_per_request.sh`.
+    quant_config: kv_quant.KVQuantPair,
     /// KV-resident bytes for this entry, computed at commit time (Wave 1.B).
     /// Used for `--prefix-cache-mem` memory-budget enforcement; sum across
     /// all entries == `current_kv_bytes`.
@@ -172,9 +173,11 @@ pub const HotPrefixCache = struct {
             if (!e.initialized) continue;
             total += @as(u64, mlx.mlx_array_size(e.keys)) * @as(u64, mlx.mlx_array_itemsize(e.keys));
             total += @as(u64, mlx.mlx_array_size(e.values)) * @as(u64, mlx.mlx_array_itemsize(e.values));
-            if (snap.config.scheme != .off) {
+            if (snap.k_config.scheme != .off) {
                 total += @as(u64, mlx.mlx_array_size(e.keys_scales)) * @as(u64, mlx.mlx_array_itemsize(e.keys_scales));
                 total += @as(u64, mlx.mlx_array_size(e.keys_biases)) * @as(u64, mlx.mlx_array_itemsize(e.keys_biases));
+            }
+            if (snap.v_config.scheme != .off) {
                 total += @as(u64, mlx.mlx_array_size(e.values_scales)) * @as(u64, mlx.mlx_array_itemsize(e.values_scales));
                 total += @as(u64, mlx.mlx_array_size(e.values_biases)) * @as(u64, mlx.mlx_array_itemsize(e.values_biases));
             }
@@ -192,7 +195,7 @@ pub const HotPrefixCache = struct {
     /// covers BOTH 4-bit and 8-bit packings: filtering on `Scheme` alone
     /// would let a 4-bit entry alias to an 8-bit slot and crash SDPA on
     /// restore. See `tests/test_kv_quant_per_request.sh`.
-    fn findBestMatch(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig) ?struct { idx: usize, shared: usize } {
+    fn findBestMatch(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantPair) ?struct { idx: usize, shared: usize } {
         var best_idx: ?usize = null;
         var best_shared: usize = 0;
         for (self.entries.items, 0..) |*e, i| {
@@ -244,7 +247,7 @@ pub const HotPrefixCache = struct {
         prompt_ids: []const u32,
         has_tools: bool,
     ) !LookupResult {
-        const match = self.findBestMatch(prompt_ids, has_tools, target_cache.config);
+        const match = self.findBestMatch(prompt_ids, has_tools, .{ .k = target_cache.k_config, .v = target_cache.v_config });
 
         if (match == null) {
             try target_cache.truncate(0, s);
@@ -360,7 +363,7 @@ pub const HotPrefixCache = struct {
         has_tools: bool,
         ssm_cps: ?[]SSMCheckpoint,
     ) !void {
-        const quant_config = source_cache.config;
+        const quant_config: kv_quant.KVQuantPair = .{ .k = source_cache.k_config, .v = source_cache.v_config };
 
         var replace_idx: ?usize = null;
         for (self.entries.items, 0..) |*e, i| {
@@ -628,9 +631,9 @@ test "HotPrefixCache: findBestMatch returns longest shared prefix" {
     try cache.entries.append(testing.allocator, .{
         .tokens = ids_a,
         .has_tools = false,
-        .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+        .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .k_config = transformer_mod.KVQuantConfig.dense, .v_config = transformer_mod.KVQuantConfig.dense },
         .last_used = 1,
-        .quant_config = kv_quant.KVQuantConfig.dense,
+        .quant_config = kv_quant.KVQuantPair.dense,
         .kv_bytes = 0,
         .ssm_checkpoints = null,
         .ssm_bytes = 0,
@@ -638,9 +641,9 @@ test "HotPrefixCache: findBestMatch returns longest shared prefix" {
     try cache.entries.append(testing.allocator, .{
         .tokens = ids_b,
         .has_tools = false,
-        .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+        .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .k_config = transformer_mod.KVQuantConfig.dense, .v_config = transformer_mod.KVQuantConfig.dense },
         .last_used = 2,
-        .quant_config = kv_quant.KVQuantConfig.dense,
+        .quant_config = kv_quant.KVQuantPair.dense,
         .kv_bytes = 0,
         .ssm_checkpoints = null,
         .ssm_bytes = 0,
@@ -648,21 +651,21 @@ test "HotPrefixCache: findBestMatch returns longest shared prefix" {
 
     // Looking up [1,2,3,4,5,6] should match entry A (5 shared tokens).
     const lookup_ids = [_]u32{ 1, 2, 3, 4, 5, 6 };
-    const m = cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantConfig.dense).?;
+    const m = cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantPair.dense).?;
     try testing.expectEqual(@as(usize, 0), m.idx);
     try testing.expectEqual(@as(usize, 5), m.shared);
 
     // Looking up [1,2,3,9,9,9,7] should match entry B (6 shared).
     const lookup_ids2 = [_]u32{ 1, 2, 3, 9, 9, 9, 7 };
-    const m2 = cache.findBestMatch(&lookup_ids2, false, kv_quant.KVQuantConfig.dense).?;
+    const m2 = cache.findBestMatch(&lookup_ids2, false, kv_quant.KVQuantPair.dense).?;
     try testing.expectEqual(@as(usize, 1), m2.idx);
     try testing.expectEqual(@as(usize, 6), m2.shared);
 
     // has_tools mismatch returns null.
-    try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, true, kv_quant.KVQuantConfig.dense));
+    try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, true, kv_quant.KVQuantPair.dense));
     // Scheme mismatch returns null — entries are dense, a query for affine
     // 4-bit cannot match (Wave 1.A: cross-scheme cache hits never happen).
-    try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantConfig.affine(4)));
+    try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantPair.uniform(kv_quant.KVQuantConfig.affine(4))));
 }
 
 test "HotPrefixCache: findBestMatch isolates affine 4-bit from affine 8-bit" {
@@ -680,9 +683,9 @@ test "HotPrefixCache: findBestMatch isolates affine 4-bit from affine 8-bit" {
     try cache.entries.append(testing.allocator, .{
         .tokens = ids,
         .has_tools = false,
-        .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = kv_quant.KVQuantConfig.affine(4) },
+        .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .k_config = kv_quant.KVQuantConfig.affine(4), .v_config = kv_quant.KVQuantConfig.affine(4) },
         .last_used = 1,
-        .quant_config = kv_quant.KVQuantConfig.affine(4),
+        .quant_config = kv_quant.KVQuantPair.uniform(kv_quant.KVQuantConfig.affine(4)),
         .kv_bytes = 0,
         .ssm_checkpoints = null,
         .ssm_bytes = 0,
@@ -690,12 +693,17 @@ test "HotPrefixCache: findBestMatch isolates affine 4-bit from affine 8-bit" {
 
     const lookup_ids = [_]u32{ 1, 2, 3, 4, 5, 6 };
     // Matching config (affine 4) hits the entry.
-    const hit = cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantConfig.affine(4)).?;
+    const hit = cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantPair.uniform(kv_quant.KVQuantConfig.affine(4))).?;
     try testing.expectEqual(@as(usize, 0), hit.idx);
     try testing.expectEqual(@as(usize, 5), hit.shared);
     // Same Scheme (.affine) but different bits MUST NOT hit — that's the
     // cross-scheme buffer-layout crash this filter guards against.
-    try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantConfig.affine(8)));
+    try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantPair.uniform(kv_quant.KVQuantConfig.affine(8))));
     // Dense query against an affine entry: also null (existing guarantee).
-    try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantConfig.dense));
+    try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantPair.dense));
+    // Asymmetric K affine-8 / V turbo-4 MUST NOT hit a symmetric affine-4
+    // entry — the per-side pair is the key, so mixed and symmetric layouts
+    // never alias.
+    const asym = kv_quant.KVQuantPair{ .k = kv_quant.KVQuantConfig.affine(8), .v = kv_quant.KVQuantConfig.turboquant(4) };
+    try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, asym));
 }

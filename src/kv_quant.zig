@@ -99,6 +99,43 @@ pub const KVQuantConfig = struct {
     }
 };
 
+/// A (K, V) pair of `KVQuantConfig`. The cache applies `.k` to keys and `.v`
+/// to values independently (llama.cpp `-ctk`/`-ctv` style), so e.g. K can be
+/// affine-8 while V is turbo-4 — the quality-safe long-context combo (K errors
+/// hurt attention more than V errors). Used as the cache-identity key wherever
+/// a single `KVQuantConfig` used to be (cache config, snapshot, prefix-cache
+/// match), so warm-reuse never mixes incompatible buffer layouts.
+pub const KVQuantPair = struct {
+    k: KVQuantConfig,
+    v: KVQuantConfig,
+
+    pub const dense: KVQuantPair = .{ .k = KVQuantConfig.dense, .v = KVQuantConfig.dense };
+
+    /// Same config on both sides — the legacy symmetric case.
+    pub fn uniform(c: KVQuantConfig) KVQuantPair {
+        return .{ .k = c, .v = c };
+    }
+
+    /// True when both sides carry the identical config (lets `update` take the
+    /// proven symmetric fast-paths instead of the per-side mixed path).
+    pub fn isUniform(self: KVQuantPair) bool {
+        return std.meta.eql(self.k, self.v);
+    }
+
+    /// True when at least one side is quantized (cache needs scale/bias
+    /// buffers and, if any side is turbo, a `TurboState`).
+    pub fn isQuant(self: KVQuantPair) bool {
+        return self.k.isQuant() or self.v.isQuant();
+    }
+
+    /// True when at least one side uses a TurboQuant scheme (needs rotation
+    /// matrices).
+    pub fn anyTurbo(self: KVQuantPair) bool {
+        return self.k.scheme == .turboquant_2 or self.k.scheme == .turboquant_4 or
+            self.v.scheme == .turboquant_2 or self.v.scheme == .turboquant_4;
+    }
+};
+
 /// One quantized K or V triple. Layout for input shape `[..., D]`:
 ///   q      : `[..., D * bits / 32]` uint32   (packed)
 ///   scales : `[..., D / group_size]` bf16
@@ -489,8 +526,10 @@ pub fn quantAttention(
     q_dense: mlx.mlx_array,
     k_triple: BorrowedTriple,
     v_triple: BorrowedTriple,
-    bits: u8,
-    group_size: u32,
+    k_bits: u8,
+    k_group_size: u32,
+    v_bits: u8,
+    v_group_size: u32,
     rk: mlx.mlx_array,
     rv: mlx.mlx_array,
     scale: f32,
@@ -588,8 +627,8 @@ pub fn quantAttention(
         k_sc_used,
         k_bi_used,
         true,
-        mlx.mlx_optional_int.some(@intCast(group_size)),
-        mlx.mlx_optional_int.some(@intCast(bits)),
+        mlx.mlx_optional_int.some(@intCast(k_group_size)),
+        mlx.mlx_optional_int.some(@intCast(k_bits)),
         "affine",
         s,
     ));
@@ -678,8 +717,8 @@ pub fn quantAttention(
         v_sc_used,
         v_bi_used,
         false,
-        mlx.mlx_optional_int.some(@intCast(group_size)),
-        mlx.mlx_optional_int.some(@intCast(bits)),
+        mlx.mlx_optional_int.some(@intCast(v_group_size)),
+        mlx.mlx_optional_int.some(@intCast(v_bits)),
         "affine",
         s,
     ));
@@ -1142,6 +1181,8 @@ test "quantAttention matches dense SDPA at 4-bit (decode, T_q=1)" {
         .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
         4,
         64,
+        4,
+        64,
         .{ .ctx = null },
         .{ .ctx = null },
         scale,
@@ -1208,6 +1249,8 @@ test "quantAttention causal mask matches dense SDPA (prefill, T_q=T_k=4)" {
         q,
         .{ .q = qk.q, .scales = qk.scales, .biases = qk.biases },
         .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
+        4,
+        64,
         4,
         64,
         .{ .ctx = null },
@@ -1285,6 +1328,8 @@ test "fused-turbo quantAttention matches dense-turbo SDPA (decode, T_q=1)" {
         .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
         4,
         64,
+        4,
+        64,
         rk,
         rv,
         scale,
@@ -1349,8 +1394,83 @@ test "fused-turbo quantAttention matches dense-turbo SDPA (causal, Rk != Rv)" {
         .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
         4,
         64,
+        4,
+        64,
         rk,
         rv,
+        scale,
+        "causal",
+        none_mask,
+        s,
+    );
+    defer _ = mlx.mlx_array_free(cand);
+
+    const ref_flat = try readF32Flat(s, ref, testing.allocator);
+    defer testing.allocator.free(ref_flat);
+    const cand_flat = try readF32Flat(s, cand, testing.allocator);
+    defer testing.allocator.free(cand_flat);
+    try testing.expectEqual(ref_flat.len, cand_flat.len);
+    var max_err: f32 = 0;
+    for (ref_flat, cand_flat) |r, c| {
+        const e = @abs(r - c);
+        if (e > max_err) max_err = e;
+    }
+    try testing.expect(max_err < 0.05);
+}
+
+// ── Asymmetric K/V validation (Feature 2) ──
+//
+// Exercises the per-side bits/group split AND per-side rotation in a single
+// call: K stored as plain affine-8 (no rotation, rk == null), V stored as
+// turbo-4 (Hadamard-rotated, rv set). This is the handover's quality-safe
+// long-context combo (K q8 + V turbo4). Reference is dense SDPA over the
+// matching per-side dequantizations.
+test "asymmetric quantAttention: K affine-8 + V turbo-4 matches dense SDPA" {
+    const s = mlx.gpuStream();
+    const B: c_int = 1;
+    const H: c_int = 2;
+    const T: c_int = 4;
+    const D: c_int = 64;
+    const q = try buildSmoothBHTD(s, B, H, T, D);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = try buildSmoothBHTD(s, B, H, T, D);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = try buildSmoothBHTD(s, B, H, T, D);
+    defer _ = mlx.mlx_array_free(v_dense);
+
+    // V rotation only — K is plain affine, so rk stays null.
+    var ts = try TurboState.initHadamard(testing.allocator, s, 1, @intCast(D));
+    defer ts.deinit();
+    const rv = ts.rv[0];
+
+    var qk = try quantizeAffine(s, k_dense, 64, 8);
+    defer qk.deinit();
+    var qv = try quantizeTurbo(s, v_dense, rv, 64, 4);
+    defer qv.deinit();
+
+    const k_ref = try dequantizeAffine(s, qk.q, qk.scales, qk.biases, 64, 8);
+    defer _ = mlx.mlx_array_free(k_ref);
+    const v_ref = try dequantizeTurbo(s, qv.q, qv.scales, qv.biases, rv, 64, 4);
+    defer _ = mlx.mlx_array_free(v_ref);
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    var ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref);
+    const none_mask = mlx.mlx_array{ .ctx = null };
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(
+        &ref, q, k_ref, v_ref, scale, "causal", none_mask, .{ .ctx = null }, s,
+    ));
+
+    const cand = try quantAttention(
+        q,
+        .{ .q = qk.q, .scales = qk.scales, .biases = qk.biases },
+        .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
+        8, // k_bits  — affine-8 K
+        64, // k_group_size
+        4, // v_bits  — turbo-4 V
+        64, // v_group_size
+        .{ .ctx = null }, // rk: K is affine, no rotation
+        rv, // rv: V is turbo
         scale,
         "causal",
         none_mask,

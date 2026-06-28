@@ -86,12 +86,17 @@ fn printUsage(io: std.Io) void {
         \\  --mtp-depth <n>     Max tokens drafted per MTP round (default: 1).
         \\                        Depths >1 adapt down per-request when the
         \\                        acceptance rate sags.
-        \\  --kv-quant <mode>   KV-cache quantization scheme:
+        \\  --kv-quant <mode>   KV-cache quantization scheme (applies to both
+        \\                        K and V unless overridden below):
         \\                        off (default), 4, 8     — affine group quant.
         \\                        turbo2, turbo4          — Hadamard-rotated
         \\                          affine at 2/4 bits; lower distortion at
         \\                          comparable storage. Per-request override
         \\                          via the `kv_quant` body field.
+        \\  --kv-quant-k <mode> Override KV-quant for the K side only (aliases
+        \\  --kv-quant-v <mode>   -ctk/-ctv, --cache-type-k/-v). Each defaults
+        \\                        to --kv-quant. The quality-safe long-context
+        \\                        combo is --kv-quant-k 8 --kv-quant-v turbo4.
         \\  --kv-attn-mode {{dense|fused}}
         \\                      Attention path for quantized KV. `dense`
         \\                        (default) dequantizes K/V before SDPA;
@@ -151,6 +156,20 @@ fn printUsage(io: std.Io) void {
     stdout_w.interface.flush() catch {};
 }
 
+/// Parse a `--kv-quant{,-k,-v}` value into a `KVQuantConfig`. Accepts our
+/// vocabulary plus a few llama.cpp synonyms (`f16`/`bf16`, `q4_0`, `q8_0`) so
+/// the `-ctk`/`-ctv` aliases feel familiar. Null = unrecognized.
+fn parseKvQuantArg(arg: []const u8) ?transformer_mod.KVQuantConfig {
+    const eql = std.mem.eql;
+    if (eql(u8, arg, "off") or eql(u8, arg, "0") or eql(u8, arg, "f16") or eql(u8, arg, "bf16"))
+        return transformer_mod.KVQuantConfig.dense;
+    if (eql(u8, arg, "4") or eql(u8, arg, "q4_0")) return transformer_mod.KVQuantConfig.affine(4);
+    if (eql(u8, arg, "8") or eql(u8, arg, "q8_0")) return transformer_mod.KVQuantConfig.affine(8);
+    if (eql(u8, arg, "turbo2")) return transformer_mod.KVQuantConfig.turboquant(2);
+    if (eql(u8, arg, "turbo4")) return transformer_mod.KVQuantConfig.turboquant(4);
+    return null;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
@@ -206,6 +225,11 @@ pub fn main(init: std.process.Init) !void {
     // --no-warmup-eager opts out for benchmarking / minimal-footprint deployments.
     var warmup_eager: bool = true;
     var kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense;
+    // Feature 2: optional per-side overrides (`--kv-quant-k`/`--kv-quant-v`,
+    // aliases `-ctk`/`-ctv`/`--cache-type-k`/`--cache-type-v`). Each defaults
+    // to `--kv-quant` when unset, so the symmetric case is unchanged.
+    var kv_quant_k_override: ?transformer_mod.KVQuantConfig = null;
+    var kv_quant_v_override: ?transformer_mod.KVQuantConfig = null;
     // Phase 2 (Plan ricky): fused attention reads K/V triples directly via
     // mlx_quantized_matmul instead of dequantizing through DenseKVView.
     // Off by default — supported for the affine AND TurboQuant schemes
@@ -398,20 +422,22 @@ pub fn main(init: std.process.Init) !void {
             idle_evict_secs = if (n > 0) n else null;
         } else if (std.mem.eql(u8, args[i], "--kv-quant") and i + 1 < args.len) {
             i += 1;
-            if (std.mem.eql(u8, args[i], "off") or std.mem.eql(u8, args[i], "0")) {
-                kv_quant_config = transformer_mod.KVQuantConfig.dense;
-            } else if (std.mem.eql(u8, args[i], "4")) {
-                kv_quant_config = transformer_mod.KVQuantConfig.affine(4);
-            } else if (std.mem.eql(u8, args[i], "8")) {
-                kv_quant_config = transformer_mod.KVQuantConfig.affine(8);
-            } else if (std.mem.eql(u8, args[i], "turbo2")) {
-                kv_quant_config = transformer_mod.KVQuantConfig.turboquant(2);
-            } else if (std.mem.eql(u8, args[i], "turbo4")) {
-                kv_quant_config = transformer_mod.KVQuantConfig.turboquant(4);
-            } else {
+            kv_quant_config = parseKvQuantArg(args[i]) orelse {
                 log.err("--kv-quant: expected one of {{off, 4, 8, turbo2, turbo4}}; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
-            }
+            };
+        } else if ((std.mem.eql(u8, args[i], "--kv-quant-k") or std.mem.eql(u8, args[i], "-ctk") or std.mem.eql(u8, args[i], "--cache-type-k")) and i + 1 < args.len) {
+            i += 1;
+            kv_quant_k_override = parseKvQuantArg(args[i]) orelse {
+                log.err("--kv-quant-k: expected one of {{off, 4, 8, turbo2, turbo4}}; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if ((std.mem.eql(u8, args[i], "--kv-quant-v") or std.mem.eql(u8, args[i], "-ctv") or std.mem.eql(u8, args[i], "--cache-type-v")) and i + 1 < args.len) {
+            i += 1;
+            kv_quant_v_override = parseKvQuantArg(args[i]) orelse {
+                log.err("--kv-quant-v: expected one of {{off, 4, 8, turbo2, turbo4}}; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--engine") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "auto")) {
@@ -541,10 +567,16 @@ pub fn main(init: std.process.Init) !void {
             no_vision,
         });
     }
-    switch (kv_quant_config.scheme) {
-        .off => log.info("[args] kv-quant: off\n", .{}),
-        .affine => log.info("[args] kv-quant: affine {d}-bit (group={d})\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
-        .turboquant_2, .turboquant_4 => log.info("[args] kv-quant: turboquant {d}-bit (group={d}, Hadamard rotation)\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
+    // Resolve the per-side KV-quant pair: each side defaults to `--kv-quant`
+    // unless its `--kv-quant-{k,v}` override was set. Used everywhere below.
+    const kv_quant_pair: transformer_mod.KVQuantPair = .{
+        .k = kv_quant_k_override orelse kv_quant_config,
+        .v = kv_quant_v_override orelse kv_quant_config,
+    };
+    if (kv_quant_pair.isUniform()) {
+        log.info("[args] kv-quant: K=V {s} {d}-bit (group={d})\n", .{ @tagName(kv_quant_pair.k.scheme), kv_quant_pair.k.bits, kv_quant_pair.k.group_size });
+    } else {
+        log.info("[args] kv-quant: K={s} {d}-bit / V={s} {d}-bit (asymmetric, group={d})\n", .{ @tagName(kv_quant_pair.k.scheme), kv_quant_pair.k.bits, @tagName(kv_quant_pair.v.scheme), kv_quant_pair.v.bits, kv_quant_pair.k.group_size });
     }
     log.info("[args] kv-attn-mode: {s}\n", .{if (kv_attn_fused_default) "fused" else "dense"});
 
@@ -732,7 +764,7 @@ pub fn main(init: std.process.Init) !void {
             .warmup_eager = warmup_eager,
             .draft_block_size = draft_block_size,
             .draft_block_size_explicit = draft_block_size_explicit,
-            .kv_quant_config = kv_quant_config,
+            .kv_quant_config = kv_quant_pair,
             .prefix_cache_capacity = server_mod.prefix_cache_capacity,
             .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
             .ssm_checkpoint_stride = server_mod.ssm_checkpoint_stride,
@@ -770,9 +802,9 @@ pub fn main(init: std.process.Init) !void {
         // Honor --kv-quant in offline mode too. The serve path threads this
         // through Slot caches via the scheduler; here we swap the
         // Transformer's own legacy cache to match.
-        if (kv_quant_config.scheme != .off) {
+        if (kv_quant_pair.isQuant()) {
             xfm.cache.deinit();
-            xfm.cache = try transformer_mod.KVCache.initWithConfigAndHeadDim(allocator, config.num_hidden_layers, kv_quant_config, config.head_dim);
+            xfm.cache = try transformer_mod.KVCache.initWithKVConfigs(allocator, config.num_hidden_layers, kv_quant_pair.k, kv_quant_pair.v, config.head_dim);
         }
 
         // JIT-compile + wire memory limits.
@@ -1301,7 +1333,7 @@ fn runDs4Serve(
         .warmup_eager = false,
         .draft_block_size = 0,
         .draft_block_size_explicit = false,
-        .kv_quant_config = transformer_mod.KVQuantConfig.dense,
+        .kv_quant_config = transformer_mod.KVQuantPair.dense,
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
         // Iteration 2: tokenize cache for ds4 too.
@@ -1561,7 +1593,7 @@ fn runLlamaServe(
         .warmup_eager = false,
         .draft_block_size = 0,
         .draft_block_size_explicit = false,
-        .kv_quant_config = transformer_mod.KVQuantConfig.dense,
+        .kv_quant_config = transformer_mod.KVQuantPair.dense,
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
         // Iteration 2 + 3-5: thread the tokenize cache + multi-session

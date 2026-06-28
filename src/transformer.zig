@@ -4,6 +4,7 @@ const mrope = @import("mrope.zig");
 const kv_quant = @import("kv_quant.zig");
 
 pub const KVQuantConfig = kv_quant.KVQuantConfig;
+pub const KVQuantPair = kv_quant.KVQuantPair;
 pub const KVQuantScheme = kv_quant.Scheme;
 
 // ── GatedDeltaNet fused Metal kernel ──
@@ -247,7 +248,12 @@ pub const KVCacheEntry = struct {
 pub const DenseKVView = struct {
     k: mlx.mlx_array,
     v: mlx.mlx_array,
-    owned: bool,
+    /// Per-side ownership: `deinit` frees `k` (resp. `v`) only when its flag is
+    /// set. They can differ in the mixed (asymmetric) path — e.g. a dense-K +
+    /// quant-V cache borrows `k` from the cache's view (false) but owns the
+    /// freshly dequantized `v` (true). Every symmetric path sets both the same.
+    k_owned: bool = false,
+    v_owned: bool = false,
 
     /// Borrowed quant triples. Set to `.ctx = null` when not applicable
     /// (scheme == .off). For both affine and the TurboQuant schemes the triple
@@ -269,21 +275,28 @@ pub const DenseKVView = struct {
     /// post-build); these are non-owning borrows, never freed by `deinit`.
     k_rot: mlx.mlx_array = .{ .ctx = null },
     v_rot: mlx.mlx_array = .{ .ctx = null },
-    /// True iff the triple fields above are populated. Lets call sites
-    /// avoid checking `.ctx == null` on every field.
+    /// True iff BOTH sides' triples are populated (a fused attention needs K
+    /// and V as quant triples). In a mixed cache with one dense side this is
+    /// false and the call site falls back to dense SDPA via `k`/`v`.
     has_quant_triple: bool = false,
-    /// Quant params copied off the cache config so call sites don't need
-    /// a pointer to it.
-    bits: u8 = 0,
-    group_size: u32 = 0,
+    /// Per-side quant params copied off the cache config so call sites don't
+    /// need a pointer to it. K and V can differ (asymmetric quant); affine and
+    /// turbo both populate their side, `.off` leaves it 0.
+    k_bits: u8 = 0,
+    k_group_size: u32 = 0,
+    v_bits: u8 = 0,
+    v_group_size: u32 = 0,
 
     pub fn deinit(self: *DenseKVView) void {
-        if (self.owned) {
+        if (self.k_owned) {
             _ = mlx.mlx_array_free(self.k);
-            _ = mlx.mlx_array_free(self.v);
             self.k = mlx.mlx_array_new();
+            self.k_owned = false;
+        }
+        if (self.v_owned) {
+            _ = mlx.mlx_array_free(self.v);
             self.v = mlx.mlx_array_new();
-            self.owned = false;
+            self.v_owned = false;
         }
         // Triple fields are non-owning borrows — never free.
     }
@@ -334,12 +347,19 @@ pub const KVCache = struct {
     entries: []KVCacheEntry,
     step: usize, // absolute sequence position (not affected by sliding window trimming)
     allocator: std.mem.Allocator,
-    config: KVQuantConfig,
+    /// Per-side quant config (Feature 2 — asymmetric K/V, llama.cpp
+    /// `-ctk`/`-ctv` style). `k_config` is applied to keys, `v_config` to
+    /// values. Equal for the symmetric/legacy case. The (k,v) pair is the
+    /// cache identity the prefix cache keys on (`snapshot` carries both), so
+    /// warm reuse never crosses an incompatible buffer layout.
+    k_config: KVQuantConfig,
+    v_config: KVQuantConfig,
     /// Wave 2 — per-cache rotation matrices for the TurboQuant schemes.
-    /// `null` for `off` and `affine`. Built once at `initWithConfig` time
-    /// when the scheme is `turboquant_*`; reused across all updates. Lives
-    /// on the cache so `snapshot`/`restore` can refcount-share through it
-    /// (immutable post-init, safe to alias across snapshots).
+    /// `null` unless at least one side is `turboquant_*`. Built once at init;
+    /// reused across all updates. Lives on the cache so `snapshot`/`restore`
+    /// can refcount-share through it (immutable post-init, safe to alias
+    /// across snapshots). Carries both K (`rk`) and V (`rv`) matrices; in a
+    /// mixed cache only the turbo side's matrices are ever built.
     quant_state: ?kv_quant.TurboState,
 
     pub fn init(allocator: std.mem.Allocator, num_layers: u32) !KVCache {
@@ -350,27 +370,33 @@ pub const KVCache = struct {
         return initWithConfigAndHeadDim(allocator, num_layers, config, 0);
     }
 
+    /// Legacy symmetric entry point — applies `config` to both K and V.
+    pub fn initWithConfigAndHeadDim(allocator: std.mem.Allocator, num_layers: u32, config: KVQuantConfig, head_dim: u32) !KVCache {
+        return initWithKVConfigs(allocator, num_layers, config, config, head_dim);
+    }
+
+    /// Asymmetric entry point: independent K and V configs (Feature 2).
     /// TurboQuant schemes need a per-layer rotation-matrix slot. The actual
     /// matrix dimension isn't known yet — Gemma 4's cached K is at
     /// `2 * head_dim`, some archs differ per layer or between K/V — so we
-    /// allocate empty slots here and `updateTurboQuant` lazy-builds the real
+    /// allocate empty slots here and the write path lazy-builds the real
     /// matrix from the observed K/V last-dim on first write. `head_dim` is
     /// accepted but only used to fail-fast on obviously-bad configs.
-    pub fn initWithConfigAndHeadDim(allocator: std.mem.Allocator, num_layers: u32, config: KVQuantConfig, head_dim: u32) !KVCache {
+    pub fn initWithKVConfigs(allocator: std.mem.Allocator, num_layers: u32, k_config: KVQuantConfig, v_config: KVQuantConfig, head_dim: u32) !KVCache {
         const entries = try allocator.alloc(KVCacheEntry, num_layers);
         errdefer allocator.free(entries);
         for (entries) |*e| {
             e.* = newEmptyKVEntry();
         }
+        _ = head_dim; // observed at first write
         var qs: ?kv_quant.TurboState = null;
-        switch (config.scheme) {
-            .turboquant_2, .turboquant_4 => {
-                _ = head_dim; // observed at first write
-                qs = try kv_quant.TurboState.initLazy(allocator, num_layers);
-            },
-            else => {},
+        // Build rotation state if EITHER side is turbo: `rk` serves a turbo K,
+        // `rv` a turbo V. The non-turbo side simply never calls its `ensure*`.
+        const pair = kv_quant.KVQuantPair{ .k = k_config, .v = v_config };
+        if (pair.anyTurbo()) {
+            qs = try kv_quant.TurboState.initLazy(allocator, num_layers);
         }
-        return .{ .entries = entries, .step = 0, .allocator = allocator, .config = config, .quant_state = qs };
+        return .{ .entries = entries, .step = 0, .allocator = allocator, .k_config = k_config, .v_config = v_config, .quant_state = qs };
     }
 
     pub fn deinit(self: *KVCache) void {
@@ -397,15 +423,17 @@ pub const KVCache = struct {
             if (src.initialized) {
                 try mlx.check(mlx.mlx_array_set(&out[i].keys, src.keys));
                 try mlx.check(mlx.mlx_array_set(&out[i].values, src.values));
-                if (self.config.scheme != .off) {
+                if (self.k_config.scheme != .off) {
                     try mlx.check(mlx.mlx_array_set(&out[i].keys_scales, src.keys_scales));
                     try mlx.check(mlx.mlx_array_set(&out[i].keys_biases, src.keys_biases));
+                }
+                if (self.v_config.scheme != .off) {
                     try mlx.check(mlx.mlx_array_set(&out[i].values_scales, src.values_scales));
                     try mlx.check(mlx.mlx_array_set(&out[i].values_biases, src.values_biases));
                 }
             }
         }
-        return .{ .entries = out, .step = self.step, .allocator = self.allocator, .config = self.config };
+        return .{ .entries = out, .step = self.step, .allocator = self.allocator, .k_config = self.k_config, .v_config = self.v_config };
     }
 
     /// Replace cache state with `snap`. Frees current entries' arrays first;
@@ -421,9 +449,11 @@ pub const KVCache = struct {
             if (src.initialized) {
                 try mlx.check(mlx.mlx_array_set(&dst.keys, src.keys));
                 try mlx.check(mlx.mlx_array_set(&dst.values, src.values));
-                if (self.config.scheme != .off) {
+                if (self.k_config.scheme != .off) {
                     try mlx.check(mlx.mlx_array_set(&dst.keys_scales, src.keys_scales));
                     try mlx.check(mlx.mlx_array_set(&dst.keys_biases, src.keys_biases));
+                }
+                if (self.v_config.scheme != .off) {
                     try mlx.check(mlx.mlx_array_set(&dst.values_scales, src.values_scales));
                     try mlx.check(mlx.mlx_array_set(&dst.values_biases, src.values_biases));
                 }
@@ -435,11 +465,17 @@ pub const KVCache = struct {
     const chunk_step = 256;
 
     pub fn update(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
-        switch (self.config.scheme) {
-            .off => return self.updateDense(layer, new_k, new_v, s, max_seq),
-            .affine => return self.updateAffine(layer, new_k, new_v, s, max_seq),
-            .turboquant_2, .turboquant_4 => return self.updateTurboQuant(layer, new_k, new_v, s, max_seq),
+        // Symmetric fast-paths preserve the exact pre-Feature-2 behavior when
+        // K and V share one config. Asymmetric (K != V) takes the per-side
+        // mixed path.
+        if (std.meta.eql(self.k_config, self.v_config)) {
+            switch (self.k_config.scheme) {
+                .off => return self.updateDense(layer, new_k, new_v, s, max_seq),
+                .affine => return self.updateAffine(layer, new_k, new_v, s, max_seq, self.k_config),
+                .turboquant_2, .turboquant_4 => return self.updateTurboQuant(layer, new_k, new_v, s, max_seq),
+            }
         }
+        return self.updateMixed(layer, new_k, new_v, s, max_seq);
     }
 
     /// Wave 2 — TurboQuant write path. Rotate K and V by the per-layer
@@ -470,7 +506,7 @@ pub const KVCache = struct {
         // before handing back to SDPA. We can't call updateAffine directly
         // because it dequantizes-without-rotate at the end; emit a thin
         // helper that returns the rotated views and we rotate-back here.
-        const rotated_view = try self.updateAffineRotated(layer, rotated_k, rotated_v, s, max_seq);
+        const rotated_view = try self.updateAffineRotated(layer, rotated_k, rotated_v, s, max_seq, self.k_config);
 
         // Now rotate the dense view back to the original basis for SDPA.
         var dense_k = mlx.mlx_array_new();
@@ -498,7 +534,8 @@ pub const KVCache = struct {
         return .{
             .k = dense_k,
             .v = dense_v,
-            .owned = true,
+            .k_owned = true,
+            .v_owned = true,
             .k_triple_q = entry.key_view,
             .k_triple_scales = entry.key_scales_view,
             .k_triple_biases = entry.key_biases_view,
@@ -508,21 +545,22 @@ pub const KVCache = struct {
             .k_rot = rk,
             .v_rot = rv,
             .has_quant_triple = true,
-            .bits = self.config.bits,
-            .group_size = self.config.group_size,
+            .k_bits = self.k_config.bits,
+            .k_group_size = self.k_config.group_size,
+            .v_bits = self.v_config.bits,
+            .v_group_size = self.v_config.group_size,
         };
     }
 
     /// Variant of `updateAffine` that returns the rotated-basis dense view
     /// instead of an unrotated one. Only called from `updateTurboQuant`,
     /// which rotates the result back before handing to SDPA.
-    fn updateAffineRotated(self: *KVCache, layer: u32, rk_in: mlx.mlx_array, rv_in: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
-        return self.updateAffine(layer, rk_in, rv_in, s, max_seq);
+    fn updateAffineRotated(self: *KVCache, layer: u32, rk_in: mlx.mlx_array, rv_in: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32, cfg: KVQuantConfig) !DenseKVView {
+        return self.updateAffine(layer, rk_in, rv_in, s, max_seq, cfg);
     }
 
-    fn updateAffine(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
+    fn updateAffine(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32, cfg: KVQuantConfig) !DenseKVView {
         const entry = &self.entries[layer];
-        const cfg = self.config;
         const group_size: u32 = cfg.group_size;
         const bits: u8 = cfg.bits;
 
@@ -596,12 +634,32 @@ pub const KVCache = struct {
         try buildSliceView(s, &entry.value_scales_view, entry.values_scales, total, view_start);
         try buildSliceView(s, &entry.value_biases_view, entry.values_biases, total, view_start);
 
-        // 8. Dequantize K/V for SDPA. Owner of these dense arrays is the
-        //    DenseKVView returned to the caller.
+        // 8. Dequantize K/V for SDPA. These dense arrays are owned by the
+        //    returned DenseKVView, but stay LAZY: a fused call site that
+        //    consumes the triples below never reads them, so the dequant is
+        //    never evaluated (no transient spike).
         const dense_k = try kv_quant.dequantizeAffine(s, entry.key_view, entry.key_scales_view, entry.key_biases_view, group_size, bits);
         errdefer _ = mlx.mlx_array_free(dense_k);
         const dense_v = try kv_quant.dequantizeAffine(s, entry.value_view, entry.value_scales_view, entry.value_biases_view, group_size, bits);
-        return .{ .k = dense_k, .v = dense_v, .owned = true };
+        // Expose the quant triples so `--kv-attn-mode fused` can consume them
+        // directly (affine: no rotation, so k_rot/v_rot stay null).
+        return .{
+            .k = dense_k,
+            .v = dense_v,
+            .k_owned = true,
+            .v_owned = true,
+            .k_triple_q = entry.key_view,
+            .k_triple_scales = entry.key_scales_view,
+            .k_triple_biases = entry.key_biases_view,
+            .v_triple_q = entry.value_view,
+            .v_triple_scales = entry.value_scales_view,
+            .v_triple_biases = entry.value_biases_view,
+            .has_quant_triple = true,
+            .k_bits = bits,
+            .k_group_size = group_size,
+            .v_bits = bits,
+            .v_group_size = group_size,
+        };
     }
 
     fn updateDense(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
@@ -721,7 +779,7 @@ pub const KVCache = struct {
             try mlx.check(mlx.mlx_slice(&entry.value_view, entry.values, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
         }
 
-        return .{ .k = entry.key_view, .v = entry.value_view, .owned = false };
+        return .{ .k = entry.key_view, .v = entry.value_view };
     }
 
     /// Read-side accessor: return a dense `[B,H,T,D]` K/V pair for the layer.
@@ -731,19 +789,24 @@ pub const KVCache = struct {
     /// SDPA call sites use this so they don't have to know the scheme.
     pub fn denseView(self: *KVCache, layer: u32, s: mlx.mlx_stream) !DenseKVView {
         const entry = &self.entries[layer];
-        switch (self.config.scheme) {
-            .off => return .{ .k = entry.key_view, .v = entry.value_view, .owned = false },
+        // Asymmetric configs read each side independently.
+        if (!std.meta.eql(self.k_config, self.v_config)) {
+            return self.denseViewMixed(layer, s);
+        }
+        switch (self.k_config.scheme) {
+            .off => return .{ .k = entry.key_view, .v = entry.value_view },
             .affine => {
                 if (!entry.initialized) {
-                    return .{ .k = entry.key_view, .v = entry.value_view, .owned = false };
+                    return .{ .k = entry.key_view, .v = entry.value_view };
                 }
-                const dense_k = try kv_quant.dequantizeAffine(s, entry.key_view, entry.key_scales_view, entry.key_biases_view, self.config.group_size, self.config.bits);
+                const dense_k = try kv_quant.dequantizeAffine(s, entry.key_view, entry.key_scales_view, entry.key_biases_view, self.k_config.group_size, self.k_config.bits);
                 errdefer _ = mlx.mlx_array_free(dense_k);
-                const dense_v = try kv_quant.dequantizeAffine(s, entry.value_view, entry.value_scales_view, entry.value_biases_view, self.config.group_size, self.config.bits);
+                const dense_v = try kv_quant.dequantizeAffine(s, entry.value_view, entry.value_scales_view, entry.value_biases_view, self.k_config.group_size, self.k_config.bits);
                 return .{
                     .k = dense_k,
                     .v = dense_v,
-                    .owned = true,
+                    .k_owned = true,
+                    .v_owned = true,
                     // Borrow the cache's quant triples so fused-attn call
                     // sites can skip the dense materialization above (the
                     // dequant arrays still get computed — mlx is lazy, so
@@ -755,13 +818,15 @@ pub const KVCache = struct {
                     .v_triple_scales = entry.value_scales_view,
                     .v_triple_biases = entry.value_biases_view,
                     .has_quant_triple = true,
-                    .bits = self.config.bits,
-                    .group_size = self.config.group_size,
+                    .k_bits = self.k_config.bits,
+                    .k_group_size = self.k_config.group_size,
+                    .v_bits = self.k_config.bits,
+                    .v_group_size = self.k_config.group_size,
                 };
             },
             .turboquant_2, .turboquant_4 => {
                 if (!entry.initialized) {
-                    return .{ .k = entry.key_view, .v = entry.value_view, .owned = false };
+                    return .{ .k = entry.key_view, .v = entry.value_view };
                 }
                 const qs = if (self.quant_state) |*q| q else return error.MissingTurboState;
                 // If we're reading before any write, the rotation matrices
@@ -769,20 +834,21 @@ pub const KVCache = struct {
                 // empty anyway when `initialized=false`, handled above).
                 const li: usize = @intCast(layer);
                 if (qs.rk_dim[li] == 0 or qs.rv_dim[li] == 0) {
-                    return .{ .k = entry.key_view, .v = entry.value_view, .owned = false };
+                    return .{ .k = entry.key_view, .v = entry.value_view };
                 }
                 const rk = qs.rk[li];
                 const rv = qs.rv[li];
-                const dense_k = try kv_quant.dequantizeTurbo(s, entry.key_view, entry.key_scales_view, entry.key_biases_view, rk, self.config.group_size, self.config.bits);
+                const dense_k = try kv_quant.dequantizeTurbo(s, entry.key_view, entry.key_scales_view, entry.key_biases_view, rk, self.k_config.group_size, self.k_config.bits);
                 errdefer _ = mlx.mlx_array_free(dense_k);
-                const dense_v = try kv_quant.dequantizeTurbo(s, entry.value_view, entry.value_scales_view, entry.value_biases_view, rv, self.config.group_size, self.config.bits);
+                const dense_v = try kv_quant.dequantizeTurbo(s, entry.value_view, entry.value_scales_view, entry.value_biases_view, rv, self.k_config.group_size, self.k_config.bits);
                 // Expose the rotated-basis triples + rotations for the fused
                 // path (mirrors `updateTurboQuant`); dense K/V above stay lazy
                 // and unevaluated when a fused call site consumes the triples.
                 return .{
                     .k = dense_k,
                     .v = dense_v,
-                    .owned = true,
+                    .k_owned = true,
+                    .v_owned = true,
                     .k_triple_q = entry.key_view,
                     .k_triple_scales = entry.key_scales_view,
                     .k_triple_biases = entry.key_biases_view,
@@ -792,11 +858,276 @@ pub const KVCache = struct {
                     .k_rot = rk,
                     .v_rot = rv,
                     .has_quant_triple = true,
-                    .bits = self.config.bits,
-                    .group_size = self.config.group_size,
+                    .k_bits = self.k_config.bits,
+                    .k_group_size = self.k_config.group_size,
+                    .v_bits = self.k_config.bits,
+                    .v_group_size = self.k_config.group_size,
                 };
             },
         }
+    }
+
+    // ── Asymmetric (mixed) K/V path (Feature 2) ──
+    //
+    // Taken when `k_config != v_config`. The K and V storage buffers are
+    // already separate on `KVCacheEntry`, so each side is quantized/stored,
+    // grown, written and viewed independently with the SAME
+    // growQuantBuf/writeAtOffset/buildSliceView helpers the symmetric paths
+    // use — only the per-side scheme dispatch is new. K and V grow in lockstep
+    // on the seq axis (shared offset), so the grow decision is computed once.
+
+    /// The six buffer/view handles for one side (K or V) of a cache entry.
+    /// `codes` holds packed quant codes (affine/turbo) or dense bf16 (`off`).
+    const SideBufs = struct {
+        codes: *mlx.mlx_array,
+        scales: *mlx.mlx_array,
+        biases: *mlx.mlx_array,
+        codes_view: *mlx.mlx_array,
+        scales_view: *mlx.mlx_array,
+        biases_view: *mlx.mlx_array,
+    };
+
+    fn kSideBufs(entry: *KVCacheEntry) SideBufs {
+        return .{
+            .codes = &entry.keys,
+            .scales = &entry.keys_scales,
+            .biases = &entry.keys_biases,
+            .codes_view = &entry.key_view,
+            .scales_view = &entry.key_scales_view,
+            .biases_view = &entry.key_biases_view,
+        };
+    }
+
+    fn vSideBufs(entry: *KVCacheEntry) SideBufs {
+        return .{
+            .codes = &entry.values,
+            .scales = &entry.values_scales,
+            .biases = &entry.values_biases,
+            .codes_view = &entry.value_view,
+            .scales_view = &entry.value_scales_view,
+            .biases_view = &entry.value_biases_view,
+        };
+    }
+
+    /// Per-side result: the dense bf16 view (always produced; lazy for quant
+    /// schemes so the fused path never evaluates it) plus the borrowed quant
+    /// triple + rotation when the side is quantized.
+    const SideOut = struct {
+        dense: mlx.mlx_array,
+        dense_owned: bool,
+        triple_q: mlx.mlx_array = .{ .ctx = null },
+        triple_scales: mlx.mlx_array = .{ .ctx = null },
+        triple_biases: mlx.mlx_array = .{ .ctx = null },
+        rot: mlx.mlx_array = .{ .ctx = null },
+        has_triple: bool = false,
+        bits: u8 = 0,
+        group_size: u32 = 0,
+    };
+
+    /// Write one side's incoming tensor and return its dense view + triple.
+    /// `rot` is the side's Hadamard matrix when `cfg` is turbo (built by the
+    /// caller from the cache's TurboState), else `.ctx == null`.
+    /// `was_init`/`need_grow`/`new_cap`/`total`/`view_start` are computed once
+    /// in `updateMixed` and shared across both sides.
+    fn writeSide(
+        bufs: SideBufs,
+        cfg: KVQuantConfig,
+        rot: mlx.mlx_array,
+        new_x: mlx.mlx_array,
+        was_init: bool,
+        need_grow: bool,
+        new_cap: c_int,
+        B: c_int,
+        heads: c_int,
+        head_dim_u32: u32,
+        offset: usize,
+        total: c_int,
+        view_start: c_int,
+        s: mlx.mlx_stream,
+    ) !SideOut {
+        // Free stale views (freeing an empty handle is harmless for the
+        // scales/biases on a dense side).
+        _ = mlx.mlx_array_free(bufs.codes_view.*);
+        _ = mlx.mlx_array_free(bufs.scales_view.*);
+        _ = mlx.mlx_array_free(bufs.biases_view.*);
+        bufs.codes_view.* = mlx.mlx_array_new();
+        bufs.scales_view.* = mlx.mlx_array_new();
+        bufs.biases_view.* = mlx.mlx_array_new();
+
+        switch (cfg.scheme) {
+            .off => {
+                // Dense storage: a single bf16 buffer, last-dim = head_dim.
+                const hd: c_int = @intCast(head_dim_u32);
+                const dtype = mlx.mlx_array_dtype(new_x);
+                if (need_grow) try growQuantBuf(s, bufs.codes, was_init, offset, new_cap, B, heads, hd, dtype);
+                try writeAtOffset(s, bufs.codes, offset, new_x);
+                try buildSliceView(s, bufs.codes_view, bufs.codes.*, total, view_start);
+                return .{ .dense = bufs.codes_view.*, .dense_owned = false };
+            },
+            .affine, .turboquant_2, .turboquant_4 => {
+                const is_turbo = cfg.scheme != .affine;
+                // Turbo: rotate into the Hadamard basis before quantizing.
+                const x_to_quant = if (is_turbo) try kv_quant.rotateLastDim(s, new_x, rot) else new_x;
+                defer if (is_turbo) {
+                    _ = mlx.mlx_array_free(x_to_quant);
+                };
+                var q = try kv_quant.quantizeAffine(s, x_to_quant, cfg.group_size, cfg.bits);
+                defer q.deinit();
+                const q_last: c_int = @intCast(head_dim_u32 * @as(u32, cfg.bits) / 32);
+                const sc_last: c_int = @intCast(head_dim_u32 / cfg.group_size);
+                if (need_grow) {
+                    try growQuantBuf(s, bufs.codes, was_init, offset, new_cap, B, heads, q_last, .uint32);
+                    try growQuantBuf(s, bufs.scales, was_init, offset, new_cap, B, heads, sc_last, .bfloat16);
+                    try growQuantBuf(s, bufs.biases, was_init, offset, new_cap, B, heads, sc_last, .bfloat16);
+                }
+                try writeAtOffset(s, bufs.codes, offset, q.q);
+                try writeAtOffset(s, bufs.scales, offset, q.scales);
+                try writeAtOffset(s, bufs.biases, offset, q.biases);
+                try buildSliceView(s, bufs.codes_view, bufs.codes.*, total, view_start);
+                try buildSliceView(s, bufs.scales_view, bufs.scales.*, total, view_start);
+                try buildSliceView(s, bufs.biases_view, bufs.biases.*, total, view_start);
+                // Dense fallback (lazy): dequant, + rotate back for turbo.
+                const dense = if (is_turbo)
+                    try kv_quant.dequantizeTurbo(s, bufs.codes_view.*, bufs.scales_view.*, bufs.biases_view.*, rot, cfg.group_size, cfg.bits)
+                else
+                    try kv_quant.dequantizeAffine(s, bufs.codes_view.*, bufs.scales_view.*, bufs.biases_view.*, cfg.group_size, cfg.bits);
+                return .{
+                    .dense = dense,
+                    .dense_owned = true,
+                    .triple_q = bufs.codes_view.*,
+                    .triple_scales = bufs.scales_view.*,
+                    .triple_biases = bufs.biases_view.*,
+                    .rot = if (is_turbo) rot else .{ .ctx = null },
+                    .has_triple = true,
+                    .bits = cfg.bits,
+                    .group_size = cfg.group_size,
+                };
+            },
+        }
+    }
+
+    /// Read one side (no write) — the `denseView` counterpart of `writeSide`.
+    /// The side's views were built by the last `update`, so this just
+    /// dequantizes (and un-rotates for turbo).
+    fn readSide(bufs: SideBufs, cfg: KVQuantConfig, rot: mlx.mlx_array, s: mlx.mlx_stream) !SideOut {
+        switch (cfg.scheme) {
+            .off => return .{ .dense = bufs.codes_view.*, .dense_owned = false },
+            .affine, .turboquant_2, .turboquant_4 => {
+                const is_turbo = cfg.scheme != .affine;
+                const dense = if (is_turbo)
+                    try kv_quant.dequantizeTurbo(s, bufs.codes_view.*, bufs.scales_view.*, bufs.biases_view.*, rot, cfg.group_size, cfg.bits)
+                else
+                    try kv_quant.dequantizeAffine(s, bufs.codes_view.*, bufs.scales_view.*, bufs.biases_view.*, cfg.group_size, cfg.bits);
+                return .{
+                    .dense = dense,
+                    .dense_owned = true,
+                    .triple_q = bufs.codes_view.*,
+                    .triple_scales = bufs.scales_view.*,
+                    .triple_biases = bufs.biases_view.*,
+                    .rot = if (is_turbo) rot else .{ .ctx = null },
+                    .has_triple = true,
+                    .bits = cfg.bits,
+                    .group_size = cfg.group_size,
+                };
+            },
+        }
+    }
+
+    /// Assemble a DenseKVView from two per-side outputs. The fused path needs
+    /// BOTH sides as quant triples, so `has_quant_triple` is the AND.
+    fn assembleView(ksw: SideOut, vsw: SideOut) DenseKVView {
+        return .{
+            .k = ksw.dense,
+            .v = vsw.dense,
+            .k_owned = ksw.dense_owned,
+            .v_owned = vsw.dense_owned,
+            .k_triple_q = ksw.triple_q,
+            .k_triple_scales = ksw.triple_scales,
+            .k_triple_biases = ksw.triple_biases,
+            .v_triple_q = vsw.triple_q,
+            .v_triple_scales = vsw.triple_scales,
+            .v_triple_biases = vsw.triple_biases,
+            .k_rot = ksw.rot,
+            .v_rot = vsw.rot,
+            .has_quant_triple = ksw.has_triple and vsw.has_triple,
+            .k_bits = ksw.bits,
+            .k_group_size = ksw.group_size,
+            .v_bits = vsw.bits,
+            .v_group_size = vsw.group_size,
+        };
+    }
+
+    fn updateMixed(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
+        const entry = &self.entries[layer];
+        const was_init = entry.initialized;
+
+        // Shared seq-axis bookkeeping (K and V grow in lockstep).
+        const k_shape = mlx.getShape(new_k);
+        const v_shape = mlx.getShape(new_v);
+        const new_len: usize = @intCast(k_shape[2]);
+        const B: c_int = k_shape[0];
+        const heads: c_int = k_shape[1];
+        const hd_k: u32 = @intCast(k_shape[3]);
+        const hd_v: u32 = @intCast(v_shape[3]);
+
+        const need_grow = !was_init or entry.offset + new_len > bufferCapacity(entry.keys);
+        const new_cap: c_int = blk: {
+            const needed = entry.offset + new_len;
+            const n_chunks = (needed + chunk_step - 1) / chunk_step;
+            break :blk @intCast(n_chunks * chunk_step);
+        };
+        const offset = entry.offset;
+        const total: c_int = @intCast(offset + new_len);
+        const is_decode = new_len == 1;
+        const view_start: c_int = if (is_decode and max_seq > 0 and offset + new_len > max_seq)
+            total - @as(c_int, @intCast(max_seq))
+        else
+            0;
+
+        // Rotation matrices only for turbo sides (lazy-built from observed dim).
+        var rk: mlx.mlx_array = .{ .ctx = null };
+        var rv: mlx.mlx_array = .{ .ctx = null };
+        if (self.k_config.scheme == .turboquant_2 or self.k_config.scheme == .turboquant_4) {
+            const qs = if (self.quant_state) |*q| q else return error.MissingTurboState;
+            rk = try qs.ensureKLayer(s, layer, hd_k);
+        }
+        if (self.v_config.scheme == .turboquant_2 or self.v_config.scheme == .turboquant_4) {
+            const qs = if (self.quant_state) |*q| q else return error.MissingTurboState;
+            rv = try qs.ensureVLayer(s, layer, hd_v);
+        }
+
+        const ksw = try writeSide(kSideBufs(entry), self.k_config, rk, new_k, was_init, need_grow, new_cap, B, heads, hd_k, offset, total, view_start, s);
+        errdefer if (ksw.dense_owned) {
+            _ = mlx.mlx_array_free(ksw.dense);
+        };
+        const vsw = try writeSide(vSideBufs(entry), self.v_config, rv, new_v, was_init, need_grow, new_cap, B, heads, hd_v, offset, total, view_start, s);
+
+        // Commit bookkeeping once both sides have written successfully.
+        entry.offset += new_len;
+        entry.initialized = true;
+        if (layer == 0) self.step += new_len;
+
+        return assembleView(ksw, vsw);
+    }
+
+    fn denseViewMixed(self: *KVCache, layer: u32, s: mlx.mlx_stream) !DenseKVView {
+        const entry = &self.entries[layer];
+        if (!entry.initialized) {
+            return .{ .k = entry.key_view, .v = entry.value_view };
+        }
+        const li: usize = @intCast(layer);
+        var rk: mlx.mlx_array = .{ .ctx = null };
+        var rv: mlx.mlx_array = .{ .ctx = null };
+        if (self.quant_state) |*qs| {
+            if ((self.k_config.scheme == .turboquant_2 or self.k_config.scheme == .turboquant_4) and qs.rk_dim[li] != 0) rk = qs.rk[li];
+            if ((self.v_config.scheme == .turboquant_2 or self.v_config.scheme == .turboquant_4) and qs.rv_dim[li] != 0) rv = qs.rv[li];
+        }
+        const ksw = try readSide(kSideBufs(entry), self.k_config, rk, s);
+        errdefer if (ksw.dense_owned) {
+            _ = mlx.mlx_array_free(ksw.dense);
+        };
+        const vsw = try readSide(vSideBufs(entry), self.v_config, rv, s);
+        return assembleView(ksw, vsw);
     }
 
     fn bufferCapacity(arr: mlx.mlx_array) usize {
@@ -898,13 +1229,17 @@ pub const KVCache = struct {
             _ = mlx.mlx_array_free(entry.value_view);
             entry.key_view = mlx.mlx_array_new();
             entry.value_view = mlx.mlx_array_new();
-            if (self.config.scheme == .affine) {
+            // Per-side: any quantized side (affine OR turbo) carries scale/bias
+            // view handles to reset.
+            if (self.k_config.scheme != .off) {
                 _ = mlx.mlx_array_free(entry.key_scales_view);
                 _ = mlx.mlx_array_free(entry.key_biases_view);
-                _ = mlx.mlx_array_free(entry.value_scales_view);
-                _ = mlx.mlx_array_free(entry.value_biases_view);
                 entry.key_scales_view = mlx.mlx_array_new();
                 entry.key_biases_view = mlx.mlx_array_new();
+            }
+            if (self.v_config.scheme != .off) {
+                _ = mlx.mlx_array_free(entry.value_scales_view);
+                _ = mlx.mlx_array_free(entry.value_biases_view);
                 entry.value_scales_view = mlx.mlx_array_new();
                 entry.value_biases_view = mlx.mlx_array_new();
             }
@@ -914,13 +1249,15 @@ pub const KVCache = struct {
                 _ = mlx.mlx_array_free(entry.values);
                 entry.keys = mlx.mlx_array_new();
                 entry.values = mlx.mlx_array_new();
-                if (self.config.scheme == .affine) {
+                if (self.k_config.scheme != .off) {
                     _ = mlx.mlx_array_free(entry.keys_scales);
                     _ = mlx.mlx_array_free(entry.keys_biases);
-                    _ = mlx.mlx_array_free(entry.values_scales);
-                    _ = mlx.mlx_array_free(entry.values_biases);
                     entry.keys_scales = mlx.mlx_array_new();
                     entry.keys_biases = mlx.mlx_array_new();
+                }
+                if (self.v_config.scheme != .off) {
+                    _ = mlx.mlx_array_free(entry.values_scales);
+                    _ = mlx.mlx_array_free(entry.values_biases);
                     entry.values_scales = mlx.mlx_array_new();
                     entry.values_biases = mlx.mlx_array_new();
                 }
@@ -942,11 +1279,15 @@ pub const KVCache = struct {
             const v_strides = [_]c_int{ 1, 1, 1, 1 };
             try mlx.check(mlx.mlx_slice(&entry.key_view, entry.keys, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
             try mlx.check(mlx.mlx_slice(&entry.value_view, entry.values, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
-            if (self.config.scheme == .affine) {
+            if (self.k_config.scheme != .off) {
                 const sc_shape = mlx.getShape(entry.keys_scales);
                 const sv_stop = [_]c_int{ sc_shape[0], sc_shape[1], seq_end, sc_shape[3] };
                 try mlx.check(mlx.mlx_slice(&entry.key_scales_view, entry.keys_scales, &v_start, 4, &sv_stop, 4, &v_strides, 4, s));
                 try mlx.check(mlx.mlx_slice(&entry.key_biases_view, entry.keys_biases, &v_start, 4, &sv_stop, 4, &v_strides, 4, s));
+            }
+            if (self.v_config.scheme != .off) {
+                const sc_shape = mlx.getShape(entry.values_scales);
+                const sv_stop = [_]c_int{ sc_shape[0], sc_shape[1], seq_end, sc_shape[3] };
                 try mlx.check(mlx.mlx_slice(&entry.value_scales_view, entry.values_scales, &v_start, 4, &sv_stop, 4, &v_strides, 4, s));
                 try mlx.check(mlx.mlx_slice(&entry.value_biases_view, entry.values_biases, &v_start, 4, &sv_stop, 4, &v_strides, 4, s));
             }
@@ -961,7 +1302,8 @@ pub const KVCacheSnapshot = struct {
     entries: []KVCacheEntry,
     step: usize,
     allocator: std.mem.Allocator,
-    config: KVQuantConfig,
+    k_config: KVQuantConfig,
+    v_config: KVQuantConfig,
 
     pub fn deinit(self: *KVCacheSnapshot) void {
         for (self.entries) |*e| {
@@ -2170,9 +2512,10 @@ pub const Transformer = struct {
 
     /// Reset all caches for a new request (KV cache + SSM state for MoE).
     pub fn resetCache(self: *Transformer) !void {
-        const prev_config = self.cache.config;
+        const prev_k = self.cache.k_config;
+        const prev_v = self.cache.v_config;
         self.cache.deinit();
-        self.cache = try KVCache.initWithConfigAndHeadDim(self.allocator, self.config.num_hidden_layers, prev_config, self.config.head_dim);
+        self.cache = try KVCache.initWithKVConfigs(self.allocator, self.config.num_hidden_layers, prev_k, prev_v, self.config.head_dim);
         if (self.ssm_entries) |entries| {
             for (entries) |*e| {
                 ssmFreeSpecCapture(e);
@@ -2207,17 +2550,20 @@ pub const Transformer = struct {
         }
 
         // Full prefix match with tokens remaining — restore cached state.
-        const prev_config = self.cache.config;
+        const prev_k = self.cache.k_config;
+        const prev_v = self.cache.v_config;
         self.cache.deinit();
-        self.cache = try KVCache.initWithConfigAndHeadDim(self.allocator, self.config.num_hidden_layers, prev_config, self.config.head_dim);
+        self.cache = try KVCache.initWithKVConfigs(self.allocator, self.config.num_hidden_layers, prev_k, prev_v, self.config.head_dim);
         self.cache.step = pc.kv_step;
         for (pc.kv_entries, 0..) |src, i| {
             if (src.initialized) {
                 try mlx.check(mlx.mlx_array_set(&self.cache.entries[i].keys, src.keys));
                 try mlx.check(mlx.mlx_array_set(&self.cache.entries[i].values, src.values));
-                if (prev_config.scheme == .affine) {
+                if (prev_k.scheme != .off) {
                     try mlx.check(mlx.mlx_array_set(&self.cache.entries[i].keys_scales, src.keys_scales));
                     try mlx.check(mlx.mlx_array_set(&self.cache.entries[i].keys_biases, src.keys_biases));
+                }
+                if (prev_v.scheme != .off) {
                     try mlx.check(mlx.mlx_array_set(&self.cache.entries[i].values_scales, src.values_scales));
                     try mlx.check(mlx.mlx_array_set(&self.cache.entries[i].values_biases, src.values_biases));
                 }
@@ -2268,16 +2614,19 @@ pub const Transformer = struct {
             self.allocator.free(kv);
             return;
         };
-        const scheme = self.cache.config.scheme;
+        const k_scheme = self.cache.k_config.scheme;
+        const v_scheme = self.cache.v_config.scheme;
         for (self.cache.entries, kv, 0..) |src, *dst, i| {
             dst.* = newEmptyKVEntry();
             dst.offset = src.offset;
             if (src.initialized) {
                 _ = mlx.mlx_array_set(&dst.keys, src.keys);
                 _ = mlx.mlx_array_set(&dst.values, src.values);
-                if (scheme == .affine) {
+                if (k_scheme != .off) {
                     _ = mlx.mlx_array_set(&dst.keys_scales, src.keys_scales);
                     _ = mlx.mlx_array_set(&dst.keys_biases, src.keys_biases);
+                }
+                if (v_scheme != .off) {
                     _ = mlx.mlx_array_set(&dst.values_scales, src.values_scales);
                     _ = mlx.mlx_array_set(&dst.values_biases, src.values_biases);
                 }
@@ -3859,7 +4208,7 @@ pub const Transformer = struct {
             // `kv_view` is the lifetime owner: in dense mode it aliases the
             // cache's view (no-op deinit); in quant mode it owns dequantized
             // dense arrays freed at scope exit, after SDPA has consumed them.
-            var kv_view: DenseKVView = .{ .k = .{}, .v = .{}, .owned = false };
+            var kv_view: DenseKVView = .{ .k = .{}, .v = .{} };
             defer kv_view.deinit();
             var full_k: mlx.mlx_array = undefined;
             var full_v: mlx.mlx_array = undefined;
@@ -3968,8 +4317,10 @@ pub const Transformer = struct {
                     q_rope,
                     kv_view.kTriple(),
                     kv_view.vTriple(),
-                    kv_view.bits,
-                    kv_view.group_size,
+                    kv_view.k_bits,
+                    kv_view.k_group_size,
+                    kv_view.v_bits,
+                    kv_view.v_group_size,
                     kv_view.k_rot,
                     kv_view.v_rot,
                     attn_scale,
@@ -5856,8 +6207,10 @@ pub const Transformer = struct {
                 q_rope,
                 kv_view.kTriple(),
                 kv_view.vTriple(),
-                kv_view.bits,
-                kv_view.group_size,
+                kv_view.k_bits,
+                kv_view.k_group_size,
+                kv_view.v_bits,
+                kv_view.v_group_size,
                 kv_view.k_rot,
                 kv_view.v_rot,
                 attn_scale,

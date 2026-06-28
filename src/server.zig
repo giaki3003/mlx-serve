@@ -1248,6 +1248,16 @@ fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
 /// that tiles over seq and never materializes the full [heads, seq, seq] attention matrix.
 /// So peak memory is dominated by (a) the persistent KV cache and (b) per-layer working
 /// tensors (QKV projections, MLP intermediates). There is no seq² term.
+/// Bytes held by one KV side (K or V) for `elems` elements under `cfg`.
+/// Quant codes are `bits/8` bytes/elem; affine and turbo additionally store a
+/// bf16 scale+bias (4 bytes) per `group_size`-element group. Dense = fp16.
+fn sideKvBytes(elems: u64, cfg: transformer_mod.KVQuantConfig) u64 {
+    if (cfg.scheme == .off) return elems * 2;
+    const code_bytes: u64 = elems * cfg.bits / 8;
+    const meta_bytes: u64 = if (cfg.group_size > 0) (elems / cfg.group_size) * 4 else 0;
+    return code_bytes + meta_bytes;
+}
+
 fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, config: *const model_mod.ModelConfig, is_anthropic: bool) !bool {
     const heads = config.num_attention_heads;
     if (heads == 0) return true; // unknown architecture, skip check
@@ -1283,7 +1293,14 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
     // == num_hidden_layers, so this is unchanged.
     const full_attn_layers: u64 = config.fullAttentionLayers();
     const linear_layers: u64 = config.num_hidden_layers - full_attn_layers;
-    const kv_bytes: u64 = full_attn_layers * 2 * seq * kv_heads * hdim * 2;
+    // KV bytes are per-side and quant-aware (Feature 2): K and V can use
+    // different schemes, so bill each separately. `elems_per_side` is one
+    // tensor's element count across the full-attention layers. The process
+    // -level pair is used (per-request overrides are a minor delta under the
+    // 25% safety margin). Dense (no scheduler / `.off`) → fp16, as before.
+    const kv_pair: transformer_mod.KVQuantPair = if (global_scheduler) |sch| sch.kv_quant_config else transformer_mod.KVQuantPair.dense;
+    const elems_per_side: u64 = full_attn_layers * seq * kv_heads * hdim;
+    const kv_bytes: u64 = sideKvBytes(elems_per_side, kv_pair.k) + sideKvBytes(elems_per_side, kv_pair.v);
     // Constant per-linear-layer state (GatedDeltaNet recurrent S + conv), fp32,
     // seq-INDEPENDENT. Small but real; included so we don't undercount.
     const ssm_state_bytes: u64 = linear_layers *
@@ -2653,11 +2670,7 @@ fn handleChatCompletions(
     // findBestMatch filters on it.
     const kv_quant_override = parseKvQuantOverride(root);
     if (kv_quant_override) |kq| {
-        switch (kq.scheme) {
-            .off => log.info("  kv-quant override: off (per-request)\n", .{}),
-            .affine => log.info("  kv-quant override: affine {d}-bit (per-request)\n", .{kq.bits}),
-            .turboquant_2, .turboquant_4 => log.info("  kv-quant override: turboquant {d}-bit (per-request)\n", .{kq.bits}),
-        }
+        log.info("  kv-quant override (per-request): k={s} v={s}\n", .{ kvSchemeLabel(kq.k), kvSchemeLabel(kq.v) });
     }
 
     // Parse enable_pld: per-request override of the --pld default.
@@ -3407,7 +3420,7 @@ fn nonStreamingViaScheduler(
     mrope: MropeData,
     logprobs_n: u32,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
-    kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_quant_override: ?transformer_mod.KVQuantPair,
     /// When non-null, the peer socket is probed on idle wakeups during the
     /// wait — a vanished client cancels the slot (aborting its prefill)
     /// instead of grinding out a ghost generation nobody will read.
@@ -3523,7 +3536,7 @@ fn handleNonStreamingGeneration(
     vision_embeddings: ?mlx.mlx_array,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
-    kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_quant_override: ?transformer_mod.KVQuantPair,
     /// Iteration 1: tokenize_ns from the parent handleChatCompletions, so
     /// the non-streaming chat response carries `timings.tokenize_ms`.
     tokenize_ns: u64,
@@ -4078,7 +4091,7 @@ fn handleStreamingGeneration(
     vision_embeddings: ?mlx.mlx_array,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
-    kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_quant_override: ?transformer_mod.KVQuantPair,
     /// Iteration 1: tokenize_ns measured by the request handler before
     /// dispatching here. Surfaced via `timings.tokenize_ms` on the final
     /// usage SSE chunk so streaming clients see the same metric as
@@ -5102,18 +5115,25 @@ fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: 
     return std.math.clamp(raw, min, max);
 }
 
-/// Wave 1.A — parse the optional per-request `kv_quant` body field. Accepts
-/// the string forms `"off"`, `"0"`, `"4"`, `"8"` and the integer forms `0`,
-/// `4`, `8`. Returns null when the field is absent or unrecognized (the
-/// caller falls back to the process-level `--kv-quant` default carried on
-/// the scheduler). Returns `KVQuantConfig.dense` for "off"/0.
-fn parseKvQuantOverride(root: std.json.ObjectMap) ?transformer_mod.KVQuantConfig {
-    const v = root.get("kv_quant") orelse return null;
+/// Short label for a single side's KV-quant scheme (per-request logging).
+fn kvSchemeLabel(cfg: transformer_mod.KVQuantConfig) []const u8 {
+    return switch (cfg.scheme) {
+        .off => "off",
+        .affine => if (cfg.bits == 8) "affine8" else "affine4",
+        .turboquant_2 => "turbo2",
+        .turboquant_4 => "turbo4",
+    };
+}
+
+/// Parse one KV-quant value (JSON string or integer) into a `KVQuantConfig`.
+/// Accepts our vocabulary (`off`/`0`, `4`, `8`, `turbo2`, `turbo4`) plus a few
+/// llama.cpp synonyms (`f16`/`bf16`, `q4_0`, `q8_0`). Null = unrecognized.
+fn parseKvQuantOne(v: std.json.Value) ?transformer_mod.KVQuantConfig {
     switch (v) {
         .string => |s| {
-            if (std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "0")) return transformer_mod.KVQuantConfig.dense;
-            if (std.mem.eql(u8, s, "4")) return transformer_mod.KVQuantConfig.affine(4);
-            if (std.mem.eql(u8, s, "8")) return transformer_mod.KVQuantConfig.affine(8);
+            if (std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "f16") or std.mem.eql(u8, s, "bf16")) return transformer_mod.KVQuantConfig.dense;
+            if (std.mem.eql(u8, s, "4") or std.mem.eql(u8, s, "q4_0")) return transformer_mod.KVQuantConfig.affine(4);
+            if (std.mem.eql(u8, s, "8") or std.mem.eql(u8, s, "q8_0")) return transformer_mod.KVQuantConfig.affine(8);
             if (std.mem.eql(u8, s, "turbo2")) return transformer_mod.KVQuantConfig.turboquant(2);
             if (std.mem.eql(u8, s, "turbo4")) return transformer_mod.KVQuantConfig.turboquant(4);
             return null;
@@ -5125,6 +5145,27 @@ fn parseKvQuantOverride(root: std.json.ObjectMap) ?transformer_mod.KVQuantConfig
             return null;
         },
         else => return null,
+    }
+}
+
+/// Wave 1.A / Feature 2 — parse the optional per-request `kv_quant` body field
+/// into a per-side `KVQuantPair`. A scalar (`"8"`, `"turbo4"`, `4`) applies to
+/// both K and V; an object `{"k": "8", "v": "turbo4"}` sets each side
+/// independently (a missing side defaults to dense). Returns null when the
+/// field is absent or unrecognized — the caller then falls back to the
+/// process-level `--kv-quant*` defaults carried on the scheduler.
+fn parseKvQuantOverride(root: std.json.ObjectMap) ?transformer_mod.KVQuantPair {
+    const v = root.get("kv_quant") orelse return null;
+    switch (v) {
+        .object => |obj| {
+            const k = if (obj.get("k")) |kv| (parseKvQuantOne(kv) orelse return null) else transformer_mod.KVQuantConfig.dense;
+            const vv = if (obj.get("v")) |vv2| (parseKvQuantOne(vv2) orelse return null) else transformer_mod.KVQuantConfig.dense;
+            return .{ .k = k, .v = vv };
+        },
+        else => {
+            const c = parseKvQuantOne(v) orelse return null;
+            return transformer_mod.KVQuantPair.uniform(c);
+        },
     }
 }
 
@@ -6293,7 +6334,7 @@ fn handleAnthropicNonStreaming(
     enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override.
-    kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_quant_override: ?transformer_mod.KVQuantPair,
     /// Iteration 1 instrumentation: nanoseconds of render+tokenize measured
     /// by the parent handleAnthropicMessages. Threaded through so the
     /// non-streaming response carries `timings.tokenize_ms`.
@@ -6507,7 +6548,7 @@ fn handleAnthropicStreaming(
     enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override.
-    kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_quant_override: ?transformer_mod.KVQuantPair,
     /// Iteration 1: tokenize_ns from parent handler. Anthropic streaming
     /// doesn't currently emit `timings` over SSE (spec doesn't model it),
     /// but plumbing the value through keeps the signature consistent with
