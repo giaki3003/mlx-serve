@@ -83,6 +83,15 @@ const Entry = struct {
     ssm_bytes: u64 = 0,
 };
 
+/// Knob #3 — when true (default), a restored UNIQUE-BRANCH entry is dropped
+/// from the hot cache right after `lookupAndRestore`: the slot now holds its KV
+/// (refcount-shared) and will re-commit a superset at end of generation, so
+/// keeping the entry only pins a full duplicate of the restored KV for the
+/// request's lifetime (the slot's first grow-on-write must copy while the
+/// buffer refcount is >1). `--hot-cache-consume off` disables it. SHARED bases
+/// are never consumed — they serve concurrent requests (see P2 eviction).
+pub var consume_on_restore: bool = true;
+
 pub const HotPrefixCache = struct {
     entries: std.ArrayList(Entry),
     max_entries: u32,
@@ -321,6 +330,11 @@ pub const HotPrefixCache = struct {
             return .{ .matched = 0, .full_match = false };
         }
 
+        // Knob #3: decide whether to consume this entry (see consume_on_restore
+        // / consumeRestoredEntry). Computed BEFORE the truncate/return below,
+        // while `e`/`m.idx` are still valid; the actual drop happens last.
+        const should_consume = consume_on_restore and !self.entryIsSharedBase(m.idx);
+
         const full_match = effective_matched == prompt_ids.len;
         const final_len: usize = if (full_match and effective_matched > 1) effective_matched - 1 else effective_matched;
 
@@ -328,14 +342,19 @@ pub const HotPrefixCache = struct {
             try target_cache.truncate(final_len, s);
         }
 
+        var result: LookupResult = undefined;
         if (full_match and effective_matched > 1) {
             target_moe_seq_offset.* = effective_matched - 1;
             log.info("  [hot-cache] full reuse {d}/{d}, re-forwarding last token\n", .{ effective_matched - 1, prompt_ids.len });
-            return .{ .matched = effective_matched - 1, .full_match = true };
+            result = .{ .matched = effective_matched - 1, .full_match = true };
+        } else {
+            log.info("  [hot-cache] reused {d}/{d} tokens (matched {d}; entry {d}/{d})\n", .{ effective_matched, prompt_ids.len, m.shared, m.idx + 1, self.entries.items.len });
+            result = .{ .matched = effective_matched, .full_match = full_match };
         }
 
-        log.info("  [hot-cache] reused {d}/{d} tokens (matched {d}; entry {d}/{d})\n", .{ effective_matched, prompt_ids.len, m.shared, m.idx + 1, self.entries.items.len });
-        return .{ .matched = effective_matched, .full_match = full_match };
+        // Consume LAST — swapRemove shifts indices, so no `e`/`m.idx` use after.
+        if (should_consume) self.consumeRestoredEntry(m.idx);
+        return result;
     }
 
     /// Commit the current `source_cache` state under the given key. Updates
@@ -533,6 +552,35 @@ pub const HotPrefixCache = struct {
             if (a[i] != b[i]) return false;
         }
         return true;
+    }
+
+    /// True if entry `idx` shares >= `shared_protect_min` leading tokens with
+    /// another live entry — i.e. it's a reuse base serving concurrent requests
+    /// (P2), not a unique branch. Such entries are NOT consumed on restore.
+    fn entryIsSharedBase(self: *const HotPrefixCache, idx: usize) bool {
+        const items = self.entries.items;
+        const toks = items[idx].tokens;
+        for (items, 0..) |*o, j| {
+            if (j == idx) continue;
+            if (sharedPrefixAtLeast(toks, o.tokens, shared_protect_min)) return true;
+        }
+        return false;
+    }
+
+    /// Knob #3 — drop a just-restored entry. The restoring slot already holds
+    /// refcount-shared copies of this entry's KV (and SSM, via ssmRestore), so
+    /// freeing the entry does NOT free the data; it just releases the entry's
+    /// extra reference so the slot's grow-on-write reclaims the old buffer
+    /// instead of leaving it pinned as a duplicate. The slot re-commits a
+    /// superset at end of generation, so the prefix isn't lost. Caller must not
+    /// touch the entry/index afterward (swapRemove shifts).
+    fn consumeRestoredEntry(self: *HotPrefixCache, idx: usize) void {
+        var evicted = self.entries.swapRemove(idx);
+        const tokens_len = evicted.tokens.len;
+        const kv_mb = @as(f64, @floatFromInt(evicted.kv_bytes)) / (1024.0 * 1024.0);
+        self.current_kv_bytes -|= evicted.kv_bytes;
+        freeEntryOwnedState(self.allocator, &evicted);
+        log.info("  [hot-cache] consumed restored entry (slot supersedes it; was {d} tokens, {d:.2} MB) — avoids post-restore KV duplicate\n", .{ tokens_len, kv_mb });
     }
 
     fn evictOneLru(self: *HotPrefixCache, reason: []const u8) void {
@@ -805,4 +853,35 @@ test "HotPrefixCache: eviction falls back to pure LRU when all are shared bases 
 
     try testing.expectEqual(@as(usize, 1), cache.entries.items.len);
     try testing.expectEqual(@as(u32, 2000), cache.entries.items[0].tokens[PFX]); // b (last_used=2) survives
+}
+
+test "HotPrefixCache: knob #3 consumes unique branch, never a shared base" {
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+
+    // a, b share a 70-token prefix (> shared_protect_min) — both reuse bases.
+    // c is fully unique.
+    const PFX: usize = 70;
+    const a = try testing.allocator.alloc(u32, PFX + 1);
+    for (a, 0..) |*t, i| t.* = @intCast(i);
+    a[PFX] = 1000;
+    const b = try testing.allocator.alloc(u32, PFX + 1);
+    for (b, 0..) |*t, i| t.* = @intCast(i);
+    b[PFX] = 2000;
+    const c = try testing.allocator.alloc(u32, PFX);
+    for (c, 0..) |*t, i| t.* = @intCast(9000 + i);
+
+    try cache.entries.append(testing.allocator, .{ .tokens = a, .has_tools = false, .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .k_config = transformer_mod.KVQuantConfig.dense, .v_config = transformer_mod.KVQuantConfig.dense }, .last_used = 1, .quant_config = kv_quant.KVQuantPair.dense, .kv_bytes = 0, .ssm_checkpoints = null, .ssm_bytes = 0 });
+    try cache.entries.append(testing.allocator, .{ .tokens = b, .has_tools = false, .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .k_config = transformer_mod.KVQuantConfig.dense, .v_config = transformer_mod.KVQuantConfig.dense }, .last_used = 2, .quant_config = kv_quant.KVQuantPair.dense, .kv_bytes = 0, .ssm_checkpoints = null, .ssm_bytes = 0 });
+    try cache.entries.append(testing.allocator, .{ .tokens = c, .has_tools = false, .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .k_config = transformer_mod.KVQuantConfig.dense, .v_config = transformer_mod.KVQuantConfig.dense }, .last_used = 3, .quant_config = kv_quant.KVQuantPair.dense, .kv_bytes = 0, .ssm_checkpoints = null, .ssm_bytes = 0 });
+
+    // Decision: a/b are shared bases (kept), c is a unique branch (consumable).
+    try testing.expect(cache.entryIsSharedBase(0));
+    try testing.expect(cache.entryIsSharedBase(1));
+    try testing.expect(!cache.entryIsSharedBase(2));
+
+    // Consume the unique branch; the two shared bases stay.
+    cache.consumeRestoredEntry(2);
+    try testing.expectEqual(@as(usize, 2), cache.entries.items.len);
+    for (cache.entries.items) |*e| try testing.expect(e.tokens[0] != 9000);
 }

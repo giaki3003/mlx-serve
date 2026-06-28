@@ -13,6 +13,7 @@ const mtp_mod = @import("mtp.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
+const prefix_cache_mod = @import("prefix_cache.zig");
 const vision_mod = @import("vision.zig");
 const ds4_arch = @import("arch/ds4.zig");
 const llama_arch = @import("arch/llama.zig");
@@ -160,6 +161,10 @@ fn printUsage(io: std.Io) void {
         \\                      Quantize the MTP head's own draft KV cache
         \\                        (default off=f16). The committed-history draft
         \\                        KV spans the full prompt; turbo4 cuts it ~4x.
+        \\  --hot-cache-consume {{on|off}}
+        \\                      Drop a restored unique-branch hot-cache entry so
+        \\                        the slot doesn't keep a duplicate of its KV for
+        \\                        the request (default on; shared bases kept).
         \\  --idle-evict-secs <n>
         \\                      Evict .ready entries with refcount==0 if
         \\                        idle for this many seconds. Default: off.
@@ -481,6 +486,16 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--mtp-kv-quant: expected one of {{off, 4, 8, turbo2, turbo4}}; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--hot-cache-consume") and i + 1 < args.len) {
+            i += 1;
+            if (std.mem.eql(u8, args[i], "on")) {
+                prefix_cache_mod.consume_on_restore = true;
+            } else if (std.mem.eql(u8, args[i], "off")) {
+                prefix_cache_mod.consume_on_restore = false;
+            } else {
+                log.err("--hot-cache-consume: expected 'on' or 'off'; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
         } else if (std.mem.eql(u8, args[i], "--idle-evict-secs") and i + 1 < args.len) {
             // Plan 05 Phase D: idle-tick eviction window. When set, the
             // inference loop's idle path evicts .ready entries (refcount==0)
