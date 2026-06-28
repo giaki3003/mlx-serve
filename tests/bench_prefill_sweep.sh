@@ -128,19 +128,21 @@ HDR="prompt_req|chunk|ssm_stride|mtp|compile_fwd|prefix_cache|max_conc|phase|tok
 emit "$HDR"
 printf '%s\n' "$HDR" | tr '|' '\t'
 
-run_phase() { # prompt max_tokens phase chunk ssm mtp pc
-  local resp; resp="$(send "$1" "$2")"
-  [[ -z "$resp" ]] && { echo "  ! empty response ($3)" >&2; return 1; }
+run_phase() { # prompt max_tokens phase chunk ssm mtp pc size
+  local prompt="$1" mt="$2" phase="$3" chunk="$4" ssm="$5" mtp="$6" pc="$7" size="$8"
+  local resp; resp="$(send "$prompt" "$mt")"
+  [[ -z "$resp" ]] && { echo "  ! empty response ($phase)" >&2; return 1; }
   local cached; cached="$(printf '%s' "$resp" | jq -r '.usage.prompt_tokens_details.cached_tokens // .usage.cached_tokens // 0' 2>/dev/null)"
   local line; line="$(trace_since_mark)"
-  [[ -z "$line" ]] && { echo "  ! no [prefill-trace] for $3 (is --prefill-trace honored?)" >&2; return 1; }
+  [[ -z "$line" ]] && { echo "  ! no [prefill-trace] for $phase (is --prefill-trace honored?)" >&2; return 1; }
   local tok ch cps wo cms ems clms lms tms cmp pt
   tok="$(field "$line" tokens)"; ch="$(field "$line" chunks)"; cps="$(field "$line" ssm_cps)"
   wo="$(field "$line" warm_off)"; cms="$(field "$line" chunked)"; ems="$(field "$line" eval)"
   clms="$(field "$line" clear)"; lms="$(field "$line" last_token)"; tms="$(field "$line" total)"
   cmp="$(compiled "$line")"
   pt="$(tps "${tok:-0}" "${tms:-0}")"
-  local row="$4|$5|$6|$7|$CF|$8|$MAX_CONCURRENT|$3|${tok:-?}|${ch:-?}|${cps:-?}|${wo:-?}|${cms:-?}|${ems:-?}|${clms:-?}|${lms:-?}|${tms:-?}|$pt|${cmp:-?}|${cached:-0}"
+  # Columns match $HDR: prompt_req|chunk|ssm_stride|mtp|compile_fwd|prefix_cache|max_conc|phase|...
+  local row="$size|$chunk|$ssm|$mtp|$CF|$pc|$MAX_CONCURRENT|$phase|${tok:-?}|${ch:-?}|${cps:-?}|${wo:-?}|${cms:-?}|${ems:-?}|${clms:-?}|${lms:-?}|${tms:-?}|$pt|${cmp:-?}|${cached:-0}"
   emit "$row"
   printf '%s\n' "$row" | tr '|' '\t'
 }
@@ -161,10 +163,10 @@ for chunk in $PREFILL_CHUNKS; do
         for sz in $PROMPT_SIZES; do
           prompt="$(make_prompt "$sz")"
           # COLD: first time this prompt is seen this server-lifetime -> cache miss.
-          run_phase "$prompt" 1 cold "$chunk" "$ssm" "$mtp" "$pc"
+          run_phase "$prompt" 1 cold "$chunk" "$ssm" "$mtp" "$pc" "$sz"
           if [[ "$pc" != "off" ]]; then
             # WARM: identical prompt -> hot prefix cache restores most of it.
-            run_phase "$prompt" 1 warm "$chunk" "$ssm" "$mtp" "$pc"
+            run_phase "$prompt" 1 warm "$chunk" "$ssm" "$mtp" "$pc" "$sz"
           fi
           if (( DECODE_TOKENS > 0 )); then
             # Approx decode tok/s = completion_tokens / (client_elapsed - prefill_total).
@@ -174,7 +176,7 @@ for chunk in $PREFILL_CHUNKS; do
             line="$(trace_since_mark)"; tms="$(field "$line" total)"
             comp="$(printf '%s' "$resp" | jq -r '.usage.completion_tokens // 0')"
             dtps="$(awk -v c="$comp" -v dt="$t1" -v st="$t0" -v pf="${tms:-0}" 'BEGIN{ w=(dt-st)-pf/1000.0; if (w>0) printf "%.1f", c/w; else print "0" }')"
-            row="$chunk|$chunk|$ssm|$mtp|$CF|$pc|$MAX_CONCURRENT|decode|$comp|-|-|-|-|-|-|-|${tms:-?}|$dtps|-|-"
+            row="$sz|$chunk|$ssm|$mtp|$CF|$pc|$MAX_CONCURRENT|decode|$comp|-|-|-|-|-|-|-|${tms:-?}|$dtps|-|-"
             emit "$row"; printf '%s\n' "$row" | tr '|' '\t'
           fi
         done
