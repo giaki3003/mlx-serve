@@ -9,13 +9,15 @@
 #   BINARY=./zig-out/bin/mlx-serve tests/bench_ornith.sh                 # default model path
 #   BINARY=./mlx-serve-bin tests/bench_ornith.sh ~/Models/<other-model>  # override binary + model
 #
-# SAFETY: this runs ONE server at a time, with the memory preflight gate ON and
-# a BOUNDED context (~20k, NOT your 190k production value). A 190k KV cache with
-# the preflight gate off is what swap-locks a 16 GB Mac in a loop — so we do NOT
-# inherit --ctx-size 190000 / --skip-mem-preflight here. Prefill *throughput*
-# characteristics (chunk count, clear_cache cost, MTP tax) transfer fine from a
-# modest ctx, so this measures the same thing safely. The sweep refuses both
-# flags in EXTRA_FLAGS. Stop any running mlx-serve before starting.
+# SAFETY: this runs ONE server at a time with a BOUNDED context (~20k, NOT your
+# 190k production value). The bounded ctx is the OOM guard — at ~20k the model +
+# KV + one prefill chunk fit in 16 GB, so the sweep can safely use
+# --skip-mem-preflight (which it needs, else the conservative auto-budget rejects
+# valid bench prompts). What crashed the Mac was 190k ctx + skip-preflight in a
+# loop; capping ctx removes that. Prefill *throughput* characteristics (chunk
+# count, clear_cache cost, MTP tax) transfer fine from a modest ctx. The sweep
+# owns --ctx-size/--skip-mem-preflight/--prefix-cache-mem. Stop any running
+# mlx-serve first.
 #
 # Why these sweeps (June-2026 prefill audit — see docs/PERF_TUNING.md):
 #   - prefill-chunk: your production launch uses 256, which splits a long prompt

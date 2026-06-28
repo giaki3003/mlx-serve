@@ -62,27 +62,38 @@ command -v curl >/dev/null || { echo "need curl on PATH" >&2; exit 1; }
 mkdir -p "$(dirname "$OUT")"
 
 # ── SAFETY ─────────────────────────────────────────────────────────────────
-# This sweep starts/stops a server per config, each pinning ~12 GB of wired GPU
-# memory. To avoid OOM-crashing / swap-locking the machine it ENFORCES two
-# invariants you must not override via EXTRA_FLAGS:
-#   1. The memory preflight gate stays ON. With --skip-mem-preflight an oversized
-#      config allocates blindly and can hard-lock a 16 GB Mac. With it ON the
-#      server refuses (HTTP 400) and the sweep records a failed cell instead.
-#   2. The context size is bounded (CTX_SIZE, default = largest prompt + 8192),
-#      NOT your 190k production value — a 190k KV cache + a big prefill chunk
-#      will not fit on 16 GB. Prefill *throughput* characteristics transfer fine
-#      from a modest ctx, so this measures the same thing safely.
-if printf '%s' "$EXTRA_FLAGS" | grep -q -- '--skip-mem-preflight'; then
-  echo "REFUSING: --skip-mem-preflight in EXTRA_FLAGS disables the OOM guard and can crash the Mac in a sweep. Remove it." >&2
-  exit 1
-fi
-if printf '%s' "$EXTRA_FLAGS" | grep -q -- '--ctx-size'; then
-  echo "REFUSING: put the context size in CTX_SIZE=<n>, not EXTRA_FLAGS (the sweep manages --ctx-size for safety)." >&2
-  exit 1
-fi
-# Bound ctx to the largest prompt + headroom unless the caller set CTX_SIZE.
+# The crash that motivated this was 190k ctx + --skip-mem-preflight in a LOOP:
+# each server reserved a ~190k-token KV cache with the OOM guard off, exhausting
+# 16 GB and swap-locking the Mac. The real safety lever is the BOUNDED context,
+# not the preflight gate — at ctx <= MAX_CTX the worst-case allocation (model +
+# KV + one prefill chunk) fits in 16 GB even with the gate off.
+#
+# So this sweep:
+#   1. Caps the context: CTX_SIZE (default = largest prompt + 8192) is rejected
+#      if it exceeds MAX_CTX (default 32768). This is what prevents the crash.
+#   2. Runs ONE server at a time and waits for each to fully exit (release wired
+#      memory) before the next starts — no overlapping ~12 GB allocations.
+#   3. Adds --skip-mem-preflight ON PURPOSE: the conservative auto-budget (which
+#      reserves the full 2 GB prefix-cache up front) otherwise rejects perfectly
+#      valid bench prompts with "prompt exceeds maximum context length". Safe
+#      here precisely because ctx is capped. Also caps the prefix-cache bytes.
+# The script OWNS --ctx-size / --skip-mem-preflight / --prefix-cache-mem; don't
+# pass them in EXTRA_FLAGS.
+for _bad in '--ctx-size' '--skip-mem-preflight' '--prefix-cache-mem'; do
+  if printf '%s' "$EXTRA_FLAGS" | grep -q -- "$_bad"; then
+    echo "REFUSING: the sweep manages $_bad itself (use CTX_SIZE / PREFIX_CACHE_MEM env, not EXTRA_FLAGS)." >&2
+    exit 1
+  fi
+done
+MAX_CTX="${MAX_CTX:-32768}"
+PREFIX_CACHE_MEM="${PREFIX_CACHE_MEM:-256MB}"
 MAX_SZ=0; for _s in $PROMPT_SIZES; do (( _s > MAX_SZ )) && MAX_SZ=$_s; done
 CTX_SIZE="${CTX_SIZE:-$(( MAX_SZ + 8192 ))}"
+if (( CTX_SIZE > MAX_CTX )); then
+  echo "REFUSING: CTX_SIZE=$CTX_SIZE exceeds MAX_CTX=$MAX_CTX — a large ctx with skip-preflight is exactly what crashed the Mac." >&2
+  echo "          Lower CTX_SIZE/PROMPT_SIZES, or raise MAX_CTX explicitly if you KNOW it fits (16 GB: keep <= ~32768)." >&2
+  exit 1
+fi
 
 LOG="$(mktemp -t mlxserve-sweep.XXXXXX)"
 SERVER_PID=""
@@ -109,11 +120,13 @@ start_server() { # extra launch flags as args
     return 1
   fi
   : > "$LOG"
-  # Memory preflight stays ON (no --skip-mem-preflight) and ctx is bounded, so an
-  # oversized config is rejected (HTTP 400) instead of OOM-locking the Mac.
+  # ctx is CAPPED (<= MAX_CTX) so --skip-mem-preflight is safe here; it's needed
+  # so the conservative auto-budget doesn't reject valid bench prompts. The
+  # prefix-cache bytes are capped too. The ctx cap is the real OOM guard.
   # shellcheck disable=SC2086
   MLX_SERVE_COMPILE_FORWARD="$CF" "$BINARY" --model "$MODEL" --serve --port "$PORT" \
-    --ctx-size "$CTX_SIZE" --log-level info --prefill-trace \
+    --ctx-size "$CTX_SIZE" --skip-mem-preflight --prefix-cache-mem "$PREFIX_CACHE_MEM" \
+    --log-level info --prefill-trace \
     --max-concurrent "$MAX_CONCURRENT" $EXTRA_FLAGS "$@" >>"$LOG" 2>&1 &
   SERVER_PID=$!
   local tries=0
