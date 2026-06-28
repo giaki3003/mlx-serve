@@ -537,142 +537,116 @@ pub fn quantAttention(
     mask_arr: mlx.mlx_array,
     s: mlx.mlx_stream,
 ) !mlx.mlx_array {
-    // GQA expansion. mlx_quantized_matmul does not broadcast across the
-    // head dim the way mlx_fast_scaled_dot_product_attention does, so for
-    // models with H_q > H_kv (Gemma 4 E4B: 8 vs 2, Qwen 3.5: 32 vs 8,
-    // every modern GQA arch) we need to either repeat K/V to match H_q or
-    // reshape Q down to H_kv groups. We pick repeat: it's one op per K
-    // and V triple component (q/scales/biases), and mlx makes the result
-    // a stride-0 view so the underlying memory isn't duplicated until
-    // the kernel reads it.
+    // GQA WITHOUT materializing K/V. `mlx_quantized_matmul` doesn't broadcast
+    // across the head dim the way fast SDPA does, so H_q > H_kv (Gemma 4: 8/2,
+    // Qwen 3.5: 16/4) must be reconciled. The previous version did this with
+    // `mlx_repeat_axis` on all SIX K/V quant components — but `repeat` PHYSICALLY
+    // copies (it is NOT the stride-0 view the old comment claimed; that's
+    // `broadcast_to`), so at long context it duplicated the entire quantized
+    // K/V cache `repeats`× per layer per forward — a multi-GB transient that
+    // OOM-aborted prefill and defeated the whole point of the fused path.
+    //
+    // Instead, fold the `repeats` group into Q's ROW axis so K/V stay at their
+    // native H_kv and pass through `quantized_matmul` untouched (no copy, no
+    // reliance on quant-matmul broadcast semantics). Q [B, H_q, T_q, D] ->
+    // [B, H_kv, repeats*T_q, D] is a zero-copy contiguous reshape: q-head
+    // `h_kv*repeats + j` lands at row `j*T_q + t_q` of kv-head `h_kv`, so each
+    // q-head still dots against its own kv-head. Scores/probs are reshaped to
+    // expose the real T_q axis for masking, then folded back for the V matmul,
+    // and the output is reshaped back to [B, H_q, T_q, D]. All reshapes are
+    // contiguous (zero-copy).
     const q_shape = mlx.getShape(q_dense);
     if (q_shape.len < 4) return error.UnexpectedQShape;
     const k_q_shape = mlx.getShape(k_triple.q);
     if (k_q_shape.len < 4) return error.UnexpectedKShape;
+    const B: c_int = q_shape[0];
     const H_q: c_int = q_shape[1];
+    const T_q: c_int = q_shape[2];
+    const D: c_int = q_shape[3];
     const H_kv: c_int = k_q_shape[1];
-    const need_gqa = H_q != H_kv;
-    const repeats: c_int = if (need_gqa) @divExact(H_q, H_kv) else 1;
-
-    // Owned-or-borrowed expansion for each triple component. When
-    // `need_gqa == false` everything aliases the caller's borrows.
-    var k_q_used = k_triple.q;
-    var k_sc_used = k_triple.scales;
-    var k_bi_used = k_triple.biases;
-    var v_q_used = v_triple.q;
-    var v_sc_used = v_triple.scales;
-    var v_bi_used = v_triple.biases;
-    var owns_k_q = false;
-    var owns_k_sc = false;
-    var owns_k_bi = false;
-    var owns_v_q = false;
-    var owns_v_sc = false;
-    var owns_v_bi = false;
-    defer {
-        if (owns_k_q) _ = mlx.mlx_array_free(k_q_used);
-        if (owns_k_sc) _ = mlx.mlx_array_free(k_sc_used);
-        if (owns_k_bi) _ = mlx.mlx_array_free(k_bi_used);
-        if (owns_v_q) _ = mlx.mlx_array_free(v_q_used);
-        if (owns_v_sc) _ = mlx.mlx_array_free(v_sc_used);
-        if (owns_v_bi) _ = mlx.mlx_array_free(v_bi_used);
-    }
-    if (need_gqa) {
-        var t = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_repeat_axis(&t, k_triple.q, repeats, 1, s));
-        k_q_used = t;
-        owns_k_q = true;
-        t = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_repeat_axis(&t, k_triple.scales, repeats, 1, s));
-        k_sc_used = t;
-        owns_k_sc = true;
-        t = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_repeat_axis(&t, k_triple.biases, repeats, 1, s));
-        k_bi_used = t;
-        owns_k_bi = true;
-        t = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_repeat_axis(&t, v_triple.q, repeats, 1, s));
-        v_q_used = t;
-        owns_v_q = true;
-        t = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_repeat_axis(&t, v_triple.scales, repeats, 1, s));
-        v_sc_used = t;
-        owns_v_sc = true;
-        t = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_repeat_axis(&t, v_triple.biases, repeats, 1, s));
-        v_bi_used = t;
-        owns_v_bi = true;
-    }
+    const repeats: c_int = @divExact(H_q, H_kv);
 
     // 0) fused-turbo: rotate Q into K's stored (Hadamard) basis. No-op when
-    //    `rk.ctx == null` (affine K). Independent of the GQA expansion above:
-    //    `rk` is `[D, D]` and broadcasts over the head dim.
-    var q_used = q_dense;
-    var owns_q = false;
+    //    `rk.ctx == null` (affine K). `rk` is `[D, D]`, broadcast over heads.
+    var q_rot = q_dense;
+    var owns_q_rot = false;
     defer {
-        if (owns_q) _ = mlx.mlx_array_free(q_used);
+        if (owns_q_rot) _ = mlx.mlx_array_free(q_rot);
     }
     if (rk.ctx != null) {
-        q_used = try rotateLastDim(s, q_dense, rk);
-        owns_q = true;
+        q_rot = try rotateLastDim(s, q_dense, rk);
+        owns_q_rot = true;
     }
 
-    // 1) scores = Q @ K^T. transpose_w=true contracts on K's quantized
-    //    last axis (D), the same dim Q contracts. Output: [B, H, T_q, T_k].
+    // Fold the head group into Q's rows (zero-copy).
+    var q_folded = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q_folded);
+    {
+        const sh = [_]c_int{ B, H_kv, repeats * T_q, D };
+        try mlx.check(mlx.mlx_reshape(&q_folded, q_rot, &sh, 4, s));
+    }
+
+    // 1) scores = Q @ K^T -> [B, H_kv, repeats*T_q, T_k]. transpose_w=true
+    //    contracts on K's quantized last axis (D). K triple used as-is.
     var scores = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(scores);
     try mlx.check(mlx.mlx_quantized_matmul(
         &scores,
-        q_used,
-        k_q_used,
-        k_sc_used,
-        k_bi_used,
+        q_folded,
+        k_triple.q,
+        k_triple.scales,
+        k_triple.biases,
         true,
         mlx.mlx_optional_int.some(@intCast(k_group_size)),
         mlx.mlx_optional_int.some(@intCast(k_bits)),
         "affine",
         s,
     ));
+    const t_k: c_int = blk: {
+        const ss = mlx.getShape(scores);
+        if (ss.len < 1) return error.UnexpectedShape;
+        break :blk ss[ss.len - 1];
+    };
 
-    // 2) scale. Fold into a single multiply rather than dividing inside
-    //    softmax — saves one op per call.
+    // 2) scale. Fold into a single multiply rather than dividing inside softmax.
     const scale_arr = mlx.mlx_array_new_float(scale);
     defer _ = mlx.mlx_array_free(scale_arr);
     var scaled = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(scaled);
     try mlx.check(mlx.mlx_multiply(&scaled, scores, scale_arr, s));
 
-    // 3) mask. We build masked_scores into `pre_softmax` and free the
-    //    intermediates at scope exit. The branches assign `pre_softmax`
-    //    to either an owned array or a borrow of `scaled`; `owns_pre`
-    //    tracks which.
+    // 3) split the folded rows back out to [B, H_kv, repeats, T_q, T_k] so the
+    //    [T_q, T_k] position/causal mask aligns on the REAL query axis (every
+    //    head in the `repeats` group shares the same per-position mask).
+    var scaled5 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scaled5);
+    {
+        const sh = [_]c_int{ B, H_kv, repeats, T_q, t_k };
+        try mlx.check(mlx.mlx_reshape(&scaled5, scaled, &sh, 5, s));
+    }
+
+    // 4) mask. `pre_softmax` is either an owned add result or a borrow of
+    //    `scaled5`; `owns_pre` tracks which.
     var pre_softmax: mlx.mlx_array = .{};
     var owns_pre = false;
     defer {
         if (owns_pre) _ = mlx.mlx_array_free(pre_softmax);
     }
     if (std.mem.eql(u8, mask_mode, "causal")) {
-        // Causal mask: upper-triangular `-inf` matching scores shape
-        // `[..., T_q, T_k]`. For decode (T_q == 1) the mask is identically
-        // zero so we skip building it.
-        const scores_shape = mlx.getShape(scaled);
-        if (scores_shape.len < 2) return error.UnexpectedShape;
-        const t_q: c_int = scores_shape[scores_shape.len - 2];
-        const t_k: c_int = scores_shape[scores_shape.len - 1];
-        if (t_q == 1) {
-            pre_softmax = scaled;
+        // Causal mask: upper-triangular `-inf`, `[T_q, T_k]`, broadcast over
+        // B/H_kv/repeats. For decode (T_q == 1) it's identically zero — skip.
+        if (T_q == 1) {
+            pre_softmax = scaled5;
         } else {
-            // Build a `[T_q, T_k]` additive mask: -inf above the diagonal
-            // anchored to the right edge (Q position 0 corresponds to
-            // K position (T_k - T_q)).
-            const offset: c_int = t_k - t_q;
-            const shape2 = [_]c_int{ t_q, t_k };
+            // -inf above the diagonal anchored to the right edge (Q position 0
+            // corresponds to K position (T_k - T_q)).
+            const offset: c_int = t_k - T_q;
+            const shape2 = [_]c_int{ T_q, t_k };
             var ones2 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(ones2);
             try mlx.check(mlx.mlx_ones(&ones2, &shape2, 2, .bfloat16, s));
             var upper = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(upper);
-            // triu(ones, k=offset+1) yields 1s strictly above the causal
-            // diagonal (positions Q can't see) and 0s on/below.
             try mlx.check(mlx.mlx_triu(&upper, ones2, offset + 1, s));
             const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
             defer _ = mlx.mlx_array_free(neg_inf);
@@ -681,41 +655,46 @@ pub fn quantAttention(
             try mlx.check(mlx.mlx_astype(&neg_inf_bf16, neg_inf, .bfloat16, s));
             var add_mask = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(add_mask);
-            // mask = upper * -inf → -inf above diag, 0 elsewhere.
             try mlx.check(mlx.mlx_multiply(&add_mask, upper, neg_inf_bf16, s));
             pre_softmax = mlx.mlx_array_new();
             owns_pre = true;
-            try mlx.check(mlx.mlx_add(&pre_softmax, scaled, add_mask, s));
+            try mlx.check(mlx.mlx_add(&pre_softmax, scaled5, add_mask, s));
         }
     } else if (std.mem.eql(u8, mask_mode, "array")) {
+        // Position mask (e.g. sliding window), shape `[1,1,T_q,T_k]` /
+        // `[1,1,1,T_k]` — broadcasts over the leading B/H_kv/repeats dims.
         pre_softmax = mlx.mlx_array_new();
         owns_pre = true;
-        try mlx.check(mlx.mlx_add(&pre_softmax, scaled, mask_arr, s));
+        try mlx.check(mlx.mlx_add(&pre_softmax, scaled5, mask_arr, s));
     } else {
-        // No mask: borrow `scaled` for the softmax input.
-        pre_softmax = scaled;
+        pre_softmax = scaled5;
     }
 
-    // 4) softmax along last axis. `precise=true` matches the fast SDPA
-    //    kernel's accumulation order (f32 reductions inside softmax) more
-    //    closely than the default; trades a small perf hit for tighter
-    //    equivalence to dense SDPA.
+    // 5) softmax along last axis (T_k). `precise=true` matches dense SDPA's
+    //    f32-reduction accumulation more closely.
+    var attn5 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(attn5);
+    try mlx.check(mlx.mlx_softmax_axis(&attn5, pre_softmax, -1, true, s));
+
+    // 6) fold the rows back to [B, H_kv, repeats*T_q, T_k] for the V matmul.
     var attn = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn);
-    try mlx.check(mlx.mlx_softmax_axis(&attn, pre_softmax, -1, true, s));
+    {
+        const sh = [_]c_int{ B, H_kv, repeats * T_q, t_k };
+        try mlx.check(mlx.mlx_reshape(&attn, attn5, &sh, 4, s));
+    }
 
-    // 5) out = attn @ V. transpose_w=false contracts attn's last axis
-    //    (T_k) with V's second-to-last (T_k) — V's quantized last axis
-    //    (D) becomes the output dim. mlx_quantized_matmul dequantizes V
-    //    on-the-fly without materializing a dense intermediate.
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
+    // 7) out = attn @ V -> [B, H_kv, repeats*T_q, D]. transpose_w=false
+    //    contracts attn's last axis (T_k) with V's second-to-last (T_k); V's
+    //    quantized last axis (D) becomes the output dim. V triple used as-is.
+    var out_folded = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out_folded);
     try mlx.check(mlx.mlx_quantized_matmul(
-        &out,
+        &out_folded,
         attn,
-        v_q_used,
-        v_sc_used,
-        v_bi_used,
+        v_triple.q,
+        v_triple.scales,
+        v_triple.biases,
         false,
         mlx.mlx_optional_int.some(@intCast(v_group_size)),
         mlx.mlx_optional_int.some(@intCast(v_bits)),
@@ -723,9 +702,17 @@ pub fn quantAttention(
         s,
     ));
 
-    // 6) fused-turbo: undo V's stored rotation. `out = (P@V) @ Rv`, so
-    //    rotating by `Rv` (= `Rvᵀ`) recovers `P@V`. No-op when `rv.ctx ==
-    //    null` (affine V).
+    // 8) un-fold the head group: [B, H_kv, repeats*T_q, D] -> [B, H_q, T_q, D]
+    //    (zero-copy; reverses the step-0 fold).
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    {
+        const sh = [_]c_int{ B, H_q, T_q, D };
+        try mlx.check(mlx.mlx_reshape(&out, out_folded, &sh, 4, s));
+    }
+
+    // 9) fused-turbo: undo V's stored rotation. `out = (P@V) @ Rv`, so rotating
+    //    by `Rv` (= `Rvᵀ`) recovers `P@V`. No-op when `rv.ctx == null`.
     if (rv.ctx != null) {
         const out_rot = try rotateLastDim(s, out, rv);
         _ = mlx.mlx_array_free(out);
@@ -1471,6 +1458,145 @@ test "asymmetric quantAttention: K affine-8 + V turbo-4 matches dense SDPA" {
         64, // v_group_size
         .{ .ctx = null }, // rk: K is affine, no rotation
         rv, // rv: V is turbo
+        scale,
+        "causal",
+        none_mask,
+        s,
+    );
+    defer _ = mlx.mlx_array_free(cand);
+
+    const ref_flat = try readF32Flat(s, ref, testing.allocator);
+    defer testing.allocator.free(ref_flat);
+    const cand_flat = try readF32Flat(s, cand, testing.allocator);
+    defer testing.allocator.free(cand_flat);
+    try testing.expectEqual(ref_flat.len, cand_flat.len);
+    var max_err: f32 = 0;
+    for (ref_flat, cand_flat) |r, c| {
+        const e = @abs(r - c);
+        if (e > max_err) max_err = e;
+    }
+    try testing.expect(max_err < 0.05);
+}
+
+// ── GQA validation (H_q > H_kv) ──
+//
+// The other quantAttention tests all use H_q == H_kv, so they never exercise
+// the GQA head-folding path — the one that used to mlx_repeat the whole K/V
+// cache and OOM at long context. These run H_q=4 / H_kv=2 (repeats=2) and
+// assert the folded path still matches dense SDPA (which broadcasts GQA
+// natively), proving q-head i correctly dots against kv-head i/repeats.
+
+test "quantAttention GQA (H_q=4,H_kv=2) affine matches dense SDPA (causal)" {
+    const s = mlx.gpuStream();
+    const B: c_int = 1;
+    const H_q: c_int = 4;
+    const H_kv: c_int = 2;
+    const T: c_int = 4;
+    const D: c_int = 64;
+    const q = try buildSmoothBHTD(s, B, H_q, T, D);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = try buildSmoothBHTD(s, B, H_kv, T, D);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = try buildSmoothBHTD(s, B, H_kv, T, D);
+    defer _ = mlx.mlx_array_free(v_dense);
+
+    var qk = try quantizeAffine(s, k_dense, 64, 4);
+    defer qk.deinit();
+    var qv = try quantizeAffine(s, v_dense, 64, 4);
+    defer qv.deinit();
+
+    const k_ref = try dequantizeAffine(s, qk.q, qk.scales, qk.biases, 64, 4);
+    defer _ = mlx.mlx_array_free(k_ref);
+    const v_ref = try dequantizeAffine(s, qv.q, qv.scales, qv.biases, 64, 4);
+    defer _ = mlx.mlx_array_free(v_ref);
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    var ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref);
+    const none_mask = mlx.mlx_array{ .ctx = null };
+    // fast SDPA broadcasts GQA (H_q/H_kv) natively → the reference grouping.
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(
+        &ref, q, k_ref, v_ref, scale, "causal", none_mask, .{ .ctx = null }, s,
+    ));
+
+    const cand = try quantAttention(
+        q,
+        .{ .q = qk.q, .scales = qk.scales, .biases = qk.biases },
+        .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
+        4,
+        64,
+        4,
+        64,
+        .{ .ctx = null },
+        .{ .ctx = null },
+        scale,
+        "causal",
+        none_mask,
+        s,
+    );
+    defer _ = mlx.mlx_array_free(cand);
+
+    const ref_flat = try readF32Flat(s, ref, testing.allocator);
+    defer testing.allocator.free(ref_flat);
+    const cand_flat = try readF32Flat(s, cand, testing.allocator);
+    defer testing.allocator.free(cand_flat);
+    try testing.expectEqual(ref_flat.len, cand_flat.len);
+    var max_err: f32 = 0;
+    for (ref_flat, cand_flat) |r, c| {
+        const e = @abs(r - c);
+        if (e > max_err) max_err = e;
+    }
+    try testing.expect(max_err < 0.05);
+}
+
+test "quantAttention GQA (H_q=4,H_kv=2) fused-turbo matches dense-turbo SDPA (causal)" {
+    const s = mlx.gpuStream();
+    const B: c_int = 1;
+    const H_q: c_int = 4;
+    const H_kv: c_int = 2;
+    const T: c_int = 4;
+    const D: c_int = 64;
+    const q = try buildSmoothBHTD(s, B, H_q, T, D);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = try buildSmoothBHTD(s, B, H_kv, T, D);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = try buildSmoothBHTD(s, B, H_kv, T, D);
+    defer _ = mlx.mlx_array_free(v_dense);
+
+    // Distinct K and V rotations (full Ornith path: turbo + GQA + causal).
+    var ts = try TurboState.initHadamard(testing.allocator, s, 1, @intCast(D));
+    defer ts.deinit();
+    const rk = ts.rk[0];
+    const rv = ts.rv[0];
+
+    var qk = try quantizeTurbo(s, k_dense, rk, 64, 4);
+    defer qk.deinit();
+    var qv = try quantizeTurbo(s, v_dense, rv, 64, 4);
+    defer qv.deinit();
+
+    const k_ref = try dequantizeTurbo(s, qk.q, qk.scales, qk.biases, rk, 64, 4);
+    defer _ = mlx.mlx_array_free(k_ref);
+    const v_ref = try dequantizeTurbo(s, qv.q, qv.scales, qv.biases, rv, 64, 4);
+    defer _ = mlx.mlx_array_free(v_ref);
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    var ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref);
+    const none_mask = mlx.mlx_array{ .ctx = null };
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(
+        &ref, q, k_ref, v_ref, scale, "causal", none_mask, .{ .ctx = null }, s,
+    ));
+
+    const cand = try quantAttention(
+        q,
+        .{ .q = qk.q, .scales = qk.scales, .biases = qk.biases },
+        .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
+        4,
+        64,
+        4,
+        64,
+        rk,
+        rv,
         scale,
         "causal",
         none_mask,
