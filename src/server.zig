@@ -1340,29 +1340,42 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
     var active_raw: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_raw);
     var active_mem: u64 = @intCast(active_raw);
-    var available: u64 = if (total_limit > active_mem) total_limit - active_mem else 0;
+    // P1: active_mem includes MLX's reclaimable buffer cache (freed under memory
+    // pressure / by mlx_clear_cache). Discount it directly via
+    // mlx_get_cache_memory so the FIRST availability check already nets it out —
+    // admitting prompts that fit once the cache is reclaimed WITHOUT thrashing
+    // it. The clear-then-remeasure below is now only the forced fallback for
+    // when even the discounted estimate is short.
+    var cache_raw: usize = 0;
+    _ = mlx.mlx_get_cache_memory(&cache_raw);
+    var reclaimable: u64 = @intCast(cache_raw);
+    var live_mem: u64 = if (active_mem > reclaimable) active_mem - reclaimable else 0;
+    var available: u64 = if (total_limit > live_mem) total_limit - live_mem else 0;
 
     // Full memory-decision breakdown so a borderline reject is debuggable.
     const MB: u64 = 1024 * 1024;
     var peak_raw: usize = 0;
     _ = mlx.mlx_get_peak_memory(&peak_raw);
-    log.info("  [mem-check] limit={d}MB active={d}MB peak={d}MB avail={d}MB | prompt={d} resident={d} uncached={d} | full_attn_layers={d} kv={d}MB ssm={d}MB work={d}MB dequant={d}MB needed={d}MB\n", .{
-        total_limit / MB, active_mem / MB, @as(u64, @intCast(peak_raw)) / MB, available / MB,
+    log.info("  [mem-check] limit={d}MB active={d}MB cache={d}MB peak={d}MB avail={d}MB | prompt={d} resident={d} uncached={d} | full_attn_layers={d} kv={d}MB ssm={d}MB work={d}MB dequant={d}MB needed={d}MB\n", .{
+        total_limit / MB, active_mem / MB, reclaimable / MB, @as(u64, @intCast(peak_raw)) / MB, available / MB,
         prompt_len, resident_prefix, prompt_len - resident_prefix,
         full_attn_layers, kv_bytes / MB, ssm_state_bytes / MB, working_bytes / MB, dense_dequant_transient / MB, needed / MB,
     });
 
-    // MLX holds a reclaimable buffer cache that inflates active_memory. If we
-    // would reject, free it and re-measure first — recovers the common "short by
-    // some reclaimable cache, not actually OOM" case. mlx_clear_cache frees only
-    // unused buffers, never live allocations, so this is safe.
+    // Forced fallback: even after discounting the reclaimable cache the estimate
+    // is short. Actually free it and re-measure for the authoritative numbers
+    // (mlx_clear_cache frees only unused buffers, never live allocations — safe).
     if (needed > available) {
         _ = mlx.mlx_clear_cache();
         active_raw = 0;
         _ = mlx.mlx_get_active_memory(&active_raw);
         active_mem = @intCast(active_raw);
-        available = if (total_limit > active_mem) total_limit - active_mem else 0;
-        log.info("  [mem-check] freed reclaimable cache -> active={d}MB avail={d}MB (needed={d}MB)\n", .{ active_mem / MB, available / MB, needed / MB });
+        cache_raw = 0;
+        _ = mlx.mlx_get_cache_memory(&cache_raw);
+        reclaimable = @intCast(cache_raw);
+        live_mem = if (active_mem > reclaimable) active_mem - reclaimable else 0;
+        available = if (total_limit > live_mem) total_limit - live_mem else 0;
+        log.info("  [mem-check] freed reclaimable cache -> active={d}MB cache={d}MB avail={d}MB (needed={d}MB)\n", .{ active_mem / MB, reclaimable / MB, available / MB, needed / MB });
     }
 
     if (needed > available) {
