@@ -61,11 +61,37 @@ command -v jq  >/dev/null || { echo "need jq on PATH" >&2; exit 1; }
 command -v curl >/dev/null || { echo "need curl on PATH" >&2; exit 1; }
 mkdir -p "$(dirname "$OUT")"
 
+# ── SAFETY ─────────────────────────────────────────────────────────────────
+# This sweep starts/stops a server per config, each pinning ~12 GB of wired GPU
+# memory. To avoid OOM-crashing / swap-locking the machine it ENFORCES two
+# invariants you must not override via EXTRA_FLAGS:
+#   1. The memory preflight gate stays ON. With --skip-mem-preflight an oversized
+#      config allocates blindly and can hard-lock a 16 GB Mac. With it ON the
+#      server refuses (HTTP 400) and the sweep records a failed cell instead.
+#   2. The context size is bounded (CTX_SIZE, default = largest prompt + 8192),
+#      NOT your 190k production value — a 190k KV cache + a big prefill chunk
+#      will not fit on 16 GB. Prefill *throughput* characteristics transfer fine
+#      from a modest ctx, so this measures the same thing safely.
+if printf '%s' "$EXTRA_FLAGS" | grep -q -- '--skip-mem-preflight'; then
+  echo "REFUSING: --skip-mem-preflight in EXTRA_FLAGS disables the OOM guard and can crash the Mac in a sweep. Remove it." >&2
+  exit 1
+fi
+if printf '%s' "$EXTRA_FLAGS" | grep -q -- '--ctx-size'; then
+  echo "REFUSING: put the context size in CTX_SIZE=<n>, not EXTRA_FLAGS (the sweep manages --ctx-size for safety)." >&2
+  exit 1
+fi
+# Bound ctx to the largest prompt + headroom unless the caller set CTX_SIZE.
+MAX_SZ=0; for _s in $PROMPT_SIZES; do (( _s > MAX_SZ )) && MAX_SZ=$_s; done
+CTX_SIZE="${CTX_SIZE:-$(( MAX_SZ + 8192 ))}"
+
 LOG="$(mktemp -t mlxserve-sweep.XXXXXX)"
 SERVER_PID=""
 cleanup() {
-  [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null
-  pkill -9 -x mlx-serve 2>/dev/null
+  if [[ -n "$SERVER_PID" ]]; then
+    kill "$SERVER_PID" 2>/dev/null
+    for _ in $(seq 1 20); do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 0.5; done
+    kill -9 "$SERVER_PID" 2>/dev/null
+  fi
   rm -f "$LOG"
 }
 trap cleanup EXIT INT TERM
@@ -76,35 +102,72 @@ trap cleanup EXIT INT TERM
 make_prompt() { awk -v n="$1" 'BEGIN{ for (i=0;i<n;i++) printf "tok%d ", i }'; }
 
 start_server() { # extra launch flags as args
-  pkill -9 -x mlx-serve 2>/dev/null; sleep 1
+  # Never run two servers at once — overlapping ~12 GB wired allocations are
+  # what crash the machine. Refuse if anything is already serving on PORT.
+  if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+    echo "  ! a server is already responding on port $PORT — stop it first (this sweep won't kill foreign servers)." >&2
+    return 1
+  fi
   : > "$LOG"
+  # Memory preflight stays ON (no --skip-mem-preflight) and ctx is bounded, so an
+  # oversized config is rejected (HTTP 400) instead of OOM-locking the Mac.
   # shellcheck disable=SC2086
   MLX_SERVE_COMPILE_FORWARD="$CF" "$BINARY" --model "$MODEL" --serve --port "$PORT" \
-    --log-level info --prefill-trace --max-concurrent "$MAX_CONCURRENT" $EXTRA_FLAGS "$@" >>"$LOG" 2>&1 &
+    --ctx-size "$CTX_SIZE" --log-level info --prefill-trace \
+    --max-concurrent "$MAX_CONCURRENT" $EXTRA_FLAGS "$@" >>"$LOG" 2>&1 &
   SERVER_PID=$!
   local tries=0
   while (( tries < 240 )); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
+    if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+      # Use the ACTUAL loaded model id for requests. A wrong model id makes the
+      # server 404, which (with -f) shows up as an empty response — the cause of
+      # the "every run empty" symptom. Fall back to "mlx-serve" if discovery fails.
+      MODEL_ID="$(curl -sf "http://127.0.0.1:$PORT/v1/models" 2>/dev/null | jq -r '.data[0].id // empty' 2>/dev/null)"
+      [[ -z "$MODEL_ID" ]] && MODEL_ID="mlx-serve"
+      echo "  model id = $MODEL_ID  (ctx=$CTX_SIZE)" >&2
+      return 0
+    fi
     kill -0 "$SERVER_PID" 2>/dev/null || { echo "  ! server died on launch; log tail:" >&2; tail -n 20 "$LOG" >&2; return 1; }
     sleep 0.5; tries=$((tries+1))
   done
   echo "  ! server failed health check" >&2; return 1
 }
 stop_server() {
-  [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null
-  wait "$SERVER_PID" 2>/dev/null
+  if [[ -n "$SERVER_PID" ]]; then
+    kill "$SERVER_PID" 2>/dev/null
+    # Wait for the process to actually exit so its wired GPU memory is released
+    # BEFORE the next server tries to grab another ~12 GB (overlap == crash).
+    local t=0
+    while kill -0 "$SERVER_PID" 2>/dev/null; do
+      sleep 0.5; t=$((t+1)); (( t > 60 )) && { kill -9 "$SERVER_PID" 2>/dev/null; break; }
+    done
+    wait "$SERVER_PID" 2>/dev/null
+  fi
   SERVER_PID=""
-  pkill -9 -x mlx-serve 2>/dev/null; sleep 1
+  # Settle: give macOS a moment to reclaim the wired allocation + free the port.
+  sleep 3
 }
 
 # Send one non-streaming chat request; echoes the response JSON. Marks the log
-# with a sentinel first so we only read THIS request's trace line.
+# with a sentinel first so we only read THIS request's trace line. NOTE: no
+# `-f` — we want the error BODY on a non-2xx (e.g. a 400 "prompt exceeds context
+# length") instead of an empty string, so failures are diagnosable. The body is
+# returned either way; the caller checks for `.choices`.
+MODEL_ID="mlx-serve"
 send() { # prompt max_tokens
   echo "===SWEEP-MARK===" >> "$LOG"
-  jq -nc --arg p "$1" --argjson mt "$2" \
-    '{model:"mlx-serve",messages:[{role:"user",content:$p}],max_tokens:$mt,temperature:0,stream:false}' \
-  | curl -sf -m 900 -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
-      -H 'content-type: application/json' -d @-
+  local body
+  body="$(jq -nc --arg p "$1" --arg model "$MODEL_ID" --argjson mt "$2" \
+    '{model:$model,messages:[{role:"user",content:$p}],max_tokens:$mt,temperature:0,stream:false}' \
+  | curl -s -m 900 -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
+      -H 'content-type: application/json' -d @-)"
+  # If the server returned an error object (or nothing), surface it for the caller.
+  if ! printf '%s' "$body" | jq -e '.choices' >/dev/null 2>&1; then
+    local err; err="$(printf '%s' "$body" | jq -r '.error.message // .error // .detail // empty' 2>/dev/null)"
+    echo "  ! request failed: ${err:-<empty/non-JSON: ${body:0:200}>}" >&2
+    return 1
+  fi
+  printf '%s' "$body"
 }
 
 # Last [prefill-trace] line since the most recent sentinel.

@@ -9,17 +9,19 @@
 #   BINARY=./zig-out/bin/mlx-serve tests/bench_ornith.sh                 # default model path
 #   BINARY=./mlx-serve-bin tests/bench_ornith.sh ~/Models/<other-model>  # override binary + model
 #
-# IMPORTANT: this stops every running mlx-serve it can find between configs, so
-# don't run it against the same machine where your production server is live.
-# The sweep forces --prefill-trace and parses the server's own trace line for
-# accurate COLD + WARM prefill tok/s.
+# SAFETY: this runs ONE server at a time, with the memory preflight gate ON and
+# a BOUNDED context (~20k, NOT your 190k production value). A 190k KV cache with
+# the preflight gate off is what swap-locks a 16 GB Mac in a loop — so we do NOT
+# inherit --ctx-size 190000 / --skip-mem-preflight here. Prefill *throughput*
+# characteristics (chunk count, clear_cache cost, MTP tax) transfer fine from a
+# modest ctx, so this measures the same thing safely. The sweep refuses both
+# flags in EXTRA_FLAGS. Stop any running mlx-serve before starting.
 #
-# Why these sweeps (from the June-2026 prefill audit — see docs/PERF_TUNING.md):
-#   - prefill-chunk: your production launch uses 256, which at 190k ctx splits a
-#     long prompt into hundreds of chunks, each paying an mlx_eval + per-chunk
-#     mlx_clear_cache barrier. Larger chunks (the activation cost is independent
-#     of the 190k KV) should cut that dramatically IF they fit — this finds the
-#     sweet spot.
+# Why these sweeps (June-2026 prefill audit — see docs/PERF_TUNING.md):
+#   - prefill-chunk: your production launch uses 256, which splits a long prompt
+#     into many chunks, each paying an mlx_eval + per-chunk mlx_clear_cache
+#     barrier. Larger chunks (per-chunk activation cost is independent of the KV
+#     size) should cut that dramatically — this finds the sweet spot.
 #   - mtp on/off: this checkpoint ships an MTP sidecar, so MTP is ON by default
 #     and taxes PREFILL (full-prompt hidden capture + per-chunk history append)
 #     for a DECODE-only speedup. The off cells quantify that prefill tax.
@@ -28,16 +30,18 @@ set -uo pipefail
 MODEL="${1:-$HOME/Models/Ornith-1.0-9B-4bit-MTP-MLX-Serve}"
 OUT="${2:-docs/perf-csvs/ornith-prefill-sweep-$(date +%Y%m%d-%H%M%S).csv}"
 
-# Hold the production KV / context / memory config constant across every cell.
-# (matches: --ctx-size 190000 --skip-mem-preflight -ctk 8 -ctv turbo4 --kv-attn-mode fused)
-export EXTRA_FLAGS="${EXTRA_FLAGS:---ctx-size 190000 --skip-mem-preflight -ctk 8 -ctv turbo4 --kv-attn-mode fused}"
+# Hold the asymmetric-KV + fused-attn config constant (low memory anyway). NO
+# --ctx-size / --skip-mem-preflight here — the sweep manages a safe ctx + keeps
+# the OOM guard on.
+export EXTRA_FLAGS="${EXTRA_FLAGS:--ctk 8 -ctv turbo4 --kv-attn-mode fused}"
+# Bounded context — fits the prompt sizes below with headroom; ~20k as suggested.
+export CTX_SIZE="${CTX_SIZE:-20480}"
 
-# Sweep the prefill knobs. Defaults chosen for the 9B/16 GB long-context case;
-# override any via env.
-export PREFILL_CHUNKS="${PREFILL_CHUNKS:-256 1024 2048 4096}"
+# Sweep the prefill knobs. Conservative defaults after the crash; override via env.
+export PREFILL_CHUNKS="${PREFILL_CHUNKS:-256 1024 2048}"
 export SSM_STRIDES="${SSM_STRIDES:-256 2048}"
 export MTP_MODES="${MTP_MODES:-on off}"
-export PROMPT_SIZES="${PROMPT_SIZES:-4000 16000 32000}"
+export PROMPT_SIZES="${PROMPT_SIZES:-1000 4000 8000 12000}"
 # Prefix cache ON so we also get the WARM-reuse number per config.
 export PREFIX_CACHE="${PREFIX_CACHE:-on}"
 
