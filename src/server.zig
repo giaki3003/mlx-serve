@@ -14,6 +14,7 @@ const token_mask_mod = @import("token_mask.zig");
 const responses_mod = @import("responses.zig");
 const pld_index = @import("pld_index.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
+const kv_quant = @import("kv_quant.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
 const ds4_ffi = @import("ds4_ffi.zig");
@@ -1323,22 +1324,32 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
     // was billed 100k× working set when the real peak is one chunk's worth.
     const chunk: u64 = @min(seq, @as(u64, generate_mod.prefill_chunk_override));
     const working_bytes: u64 = 8 * chunk * @max(hidden, ffn) * 2;
-    // PREFILL attention transient. Fused attention is DECODE-ONLY (prefill
-    // always uses flash SDPA over DEQUANTIZED K/V), so a quantized KV cache
-    // materializes the full f16 K/V per full-attn layer during the last chunk's
-    // attention — a multi-GB transient (≈2.4 GB at 73k over 8 layers held by
-    // the async-eval'd chunk graph) that `working_bytes` (MLP-only) ignores,
-    // and the thing that tips a cold long prefill past the wired cap into a hard
-    // Metal OOM (Abort trap: 6, far worse than a clean 400). Applies to ANY
-    // quantized cache — the `--kv-attn-mode fused` flag does NOT exclude it,
-    // because fused never runs at prefill (an earlier version wrongly gated this
-    // on it, so a fused run modelled ZERO prefill transient and OOM'd).
-    const dense_dequant_transient: u64 = if (kv_pair.isQuant())
-        full_attn_layers * 2 * @as(u64, @intCast(prompt_len)) * kv_heads * hdim * 2
+    // PREFILL attention transient — MUST mirror the call-site routing
+    // (transformer.zig `preferTiledPrefill`), or admission rejects warm turns
+    // the runtime would actually serve. The heaviest prefill chunk has
+    // T_q = `chunk`; a quantized cache then pays ONE of two transients:
+    //   * DENSE (cold full-chunk prefill, OR fused mode off): every full-attn
+    //     layer materializes the full f16 K/V to feed flash SDPA, stacked across
+    //     the async-eval'd graph — O(full_attn_layers · t_k), the multi-GB spike
+    //     (≈2.3 GB at 73k×8 layers) that tips a cold long prefill past the wired
+    //     cap into a hard Metal OOM (Abort trap: 6, far worse than a clean 400).
+    //   * TILED (decode-shaped / warm continuation, fused mode on): the K-tiled
+    //     path holds only the bounded [H_q, T_q, block] scores tile —
+    //     O(T_q · block), context-FLAT. This is what lets a warm turn that adds
+    //     a few tokens to a 73k context fit: it does NOT re-dequantize the
+    //     context. The plain DECODE-ONLY model billed dense here and rejected
+    //     turn 2 of a long conversation even though tiled fused serves it.
+    const fused_mode = server_config.default_kv_attn_fused;
+    const prefill_tiled = kv_pair.isQuant() and fused_mode and
+        kv_quant.preferTiledPrefill(@intCast(heads), kv_heads, chunk, @as(u64, kv_quant.kv_attn_block), @intCast(prompt_len), full_attn_layers, hdim);
+    const prefill_attn_transient: u64 = if (!kv_pair.isQuant())
+        0
+    else if (prefill_tiled)
+        kv_quant.tiledScoreTransientBytes(@intCast(heads), chunk, @as(u64, kv_quant.kv_attn_block), @intCast(prompt_len))
     else
-        0;
+        kv_quant.denseDequantTransientBytes(full_attn_layers, @intCast(prompt_len), kv_heads, hdim);
     // Total estimate with 25% safety margin
-    const needed: u64 = (kv_bytes + ssm_state_bytes + working_bytes + dense_dequant_transient) * 5 / 4;
+    const needed: u64 = (kv_bytes + ssm_state_bytes + working_bytes + prefill_attn_transient) * 5 / 4;
 
     // Available = GPU working-set ceiling minus current usage (model weights,
     // resident hot-cache KV, etc.). Uses the same real Metal limit as the
@@ -1364,10 +1375,11 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
     const MB: u64 = 1024 * 1024;
     var peak_raw: usize = 0;
     _ = mlx.mlx_get_peak_memory(&peak_raw);
-    log.info("  [mem-check] limit={d}MB active={d}MB cache={d}MB peak={d}MB avail={d}MB | prompt={d} resident={d} uncached={d} | full_attn_layers={d} kv={d}MB ssm={d}MB work={d}MB dequant={d}MB needed={d}MB\n", .{
+    const attn_path: []const u8 = if (!kv_pair.isQuant()) "n/a" else if (prefill_tiled) "tiled" else "dense";
+    log.info("  [mem-check] limit={d}MB active={d}MB cache={d}MB peak={d}MB avail={d}MB | prompt={d} resident={d} uncached={d} chunk={d} | full_attn_layers={d} kv={d}MB ssm={d}MB work={d}MB attn={d}MB({s}) needed={d}MB\n", .{
         total_limit / MB, active_mem / MB, reclaimable / MB, @as(u64, @intCast(peak_raw)) / MB, available / MB,
-        prompt_len, resident_prefix, prompt_len - resident_prefix,
-        full_attn_layers, kv_bytes / MB, ssm_state_bytes / MB, working_bytes / MB, dense_dequant_transient / MB, needed / MB,
+        prompt_len, resident_prefix, prompt_len - resident_prefix, chunk,
+        full_attn_layers, kv_bytes / MB, ssm_state_bytes / MB, working_bytes / MB, prefill_attn_transient / MB, attn_path, needed / MB,
     });
 
     // Forced fallback: even after discounting the reclaimable cache the estimate
@@ -1390,11 +1402,17 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         const needed_mb = needed / (1024 * 1024);
         const avail_mb = available / (1024 * 1024);
         log.warn("  prompt {d} tokens ({d} uncached after prefix cache) needs ~{d}MB (KV+working+margin), ~{d}MB available — rejecting\n", .{ prompt_len, prompt_len - resident_prefix, needed_mb, avail_mb });
-        // When the prefill KV-dequant transient dominates, the levers are a
-        // higher --wired-limit, a shorter prompt, or a smaller model — NOT
-        // fused (it's decode-only; prefill always dequantizes).
-        const hint: []const u8 = if (dense_dequant_transient > 0)
-            " The prefill KV-dequant transient dominates — raise --wired-limit, shorten the prompt, or use a smaller model."
+        // When the dense KV-dequant transient dominates, the new lever is the
+        // tiled path: fused mode routes warm (small-T_q) prefill through it for
+        // free, and lowering --prefill-chunk shrinks each chunk's T_q until even
+        // a cold prefill qualifies (flat, slower). Plus the old levers
+        // (--wired-limit, shorter prompt). A tiled rejection is genuinely tight
+        // — only prompt size / model size help.
+        const dense_dominates = prefill_attn_transient > 0 and !prefill_tiled;
+        const hint: []const u8 = if (dense_dominates and !fused_mode)
+            " The prefill KV-dequant transient dominates — enable --kv-attn-mode fused (warm continuations then skip the dequant), lower --prefill-chunk to route prefill through the flat tiled path, raise --wired-limit, or shorten the prompt."
+        else if (dense_dominates)
+            " The cold-prefill KV-dequant transient dominates — lower --prefill-chunk (e.g. 512-1024) to route prefill through the flat tiled path, raise --wired-limit, or shorten the prompt."
         else
             " Reduce prompt size or use a smaller model.";
         const msg = try std.fmt.allocPrint(allocator,

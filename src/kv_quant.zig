@@ -520,6 +520,65 @@ pub const BorrowedTriple = struct {
 /// not pair a large value with a large `--prefill-chunk`.
 pub var kv_attn_block: u32 = 4096;
 
+/// Absolute ceiling (MB) on the tiled-attention scores transient before a
+/// prefill chunk is refused the tiled path regardless of the tiled-vs-dense
+/// comparison (0 = no ceiling). Safety override for `--kv-attn-tiled-budget`.
+pub var kv_attn_tiled_budget_mb: u32 = 2048;
+
+/// f32-equivalent copies of the per-block scores tile that coexist within ONE
+/// block iteration. Zig `defer`s free at SCOPE (iteration) end, so every
+/// `[.., rT_q, blk]` temporary stacks until the loop body closes:
+/// s_bf(½)+sf+sc+s_mn+p+p_bf(½) ≈ 5, plus sc5+sc5m+sm on a straddling block ≈ 8.
+/// Use the straddle figure as the conservative peak.
+const TILED_SCORE_COPIES: u64 = 8;
+
+/// Peak bytes of the K-tiled attention's per-block scores transient:
+/// `[B=1, H_q, T_q, min(block, t_k)]` f32 × the coexisting-copy factor. This is
+/// the WHOLE-prefill peak — block tiles are freed each iteration and the
+/// per-layer carry (acc/l/m, ~T_q·D) is negligible, so layers do NOT stack
+/// (unlike the dense dequant path). Flat in t_k beyond one block; grows with
+/// T_q, which is why it's cheap on a warm turn (small T_q) and not on a cold
+/// chunk (T_q == prefill chunk).
+pub fn tiledScoreTransientBytes(h_q: u64, t_q: u64, block_k: u64, t_k: u64) u64 {
+    const eff_block = @min(block_k, @max(@as(u64, 1), t_k));
+    return TILED_SCORE_COPIES * 4 * h_q * t_q * eff_block;
+}
+
+/// Peak bytes of the DENSE path's prefill dequant transient: every
+/// full-attention layer materializes the full f16 K AND V to feed flash SDPA,
+/// and the async-eval'd chunk graph can hold all of them at once — they STACK,
+/// hence the `full_attn_layers` factor. Grows with t_k (the full context), so
+/// it's the term that dominates a warm continuation even when only a few tokens
+/// are new.
+pub fn denseDequantTransientBytes(full_attn_layers: u64, t_k: u64, h_kv: u64, hdim: u64) u64 {
+    return full_attn_layers * 2 * t_k * h_kv * hdim * 2;
+}
+
+/// Route a PREFILL attention chunk through the K-tiled fused path iff its
+/// bounded scores transient is both cheaper than the dense dequant it would
+/// replace AND under the absolute ceiling. The discriminator is T_q:
+///   * warm continuation (small T_q): tiled tile ≪ dense's O(t_k) dequant → TILED.
+///     This is the case the plain `!is_prefill` gate wrongly forced to dense,
+///     re-dequantizing the whole context every turn and rejecting multi-turn.
+///   * cold prefill (T_q == full chunk): `[H_q, chunk, block]` dwarfs the dense
+///     dequant → DENSE (flash SDPA, which tiles both axes in-kernel).
+/// Decode (T_q==1) is gated separately at the call sites (always tiled) and does
+/// not consult this. Callers must also confirm fused mode + a quantized cache.
+pub fn preferTiledPrefill(
+    h_q: u64,
+    h_kv: u64,
+    t_q: u64,
+    block_k: u64,
+    t_k: u64,
+    full_attn_layers: u64,
+    hdim: u64,
+) bool {
+    const tiled = tiledScoreTransientBytes(h_q, t_q, block_k, t_k);
+    if (kv_attn_tiled_budget_mb != 0 and
+        tiled > @as(u64, kv_attn_tiled_budget_mb) * 1024 * 1024) return false;
+    return tiled < denseDequantTransientBytes(full_attn_layers, t_k, h_kv, hdim);
+}
+
 /// Slice a `[B, H, T, X]` array to `[B, H, t0:t1, X]` along the sequence axis.
 /// Caller owns the result. (The K/V quant triples are already strided cache
 /// views; `mlx_quantized_matmul` consumes a further slice fine.)
@@ -1995,4 +2054,100 @@ test "tiled fused: decode (T_q=1) multi-block GQA + turbo matches dense SDPA" {
         if (e > max_err) max_err = e;
     }
     try testing.expect(max_err < 0.05);
+}
+
+test "tiled fused: warm continuation (T_q=3 << T_k=30) GQA causal matches dense SDPA" {
+    // The case the !is_prefill gate wrongly forced to dense: a few new query
+    // tokens (T_q=3) attending over a long resident context (T_k=30), aligned to
+    // the tail (q0 = T_k - T_q = 27). With block=8 the first three blocks are
+    // fully visible (no mask) and only the partial last block [24,30) straddles
+    // — the warm-turn signature the tile-size gate routes back to tiled.
+    const s = mlx.gpuStream();
+    const saved = kv_attn_block;
+    kv_attn_block = 8;
+    defer kv_attn_block = saved;
+
+    const B: c_int = 1;
+    const H_q: c_int = 4;
+    const H_kv: c_int = 2;
+    const T_q: c_int = 3;
+    const T_k: c_int = 30; // not a multiple of 8 → partial tail block too
+    const D: c_int = 64;
+    const q = try buildSmoothBHTD(s, B, H_q, T_q, D);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = try buildSmoothBHTD(s, B, H_kv, T_k, D);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = try buildSmoothBHTD(s, B, H_kv, T_k, D);
+    defer _ = mlx.mlx_array_free(v_dense);
+
+    var qk = try quantizeAffine(s, k_dense, 64, 4);
+    defer qk.deinit();
+    var qv = try quantizeAffine(s, v_dense, 64, 4);
+    defer qv.deinit();
+    const k_ref = try dequantizeAffine(s, qk.q, qk.scales, qk.biases, 64, 4);
+    defer _ = mlx.mlx_array_free(k_ref);
+    const v_ref = try dequantizeAffine(s, qv.q, qv.scales, qv.biases, 64, 4);
+    defer _ = mlx.mlx_array_free(v_ref);
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    var ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref);
+    const none_mask = mlx.mlx_array{ .ctx = null };
+    // Dense SDPA "causal" tail-aligns T_q<T_k queries (row i ↔ key q0+i) and
+    // broadcasts GQA — the exact semantics tiledCausalAttention must match.
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(
+        &ref, q, k_ref, v_ref, scale, "causal", none_mask, .{ .ctx = null }, s,
+    ));
+
+    const cand = try quantAttention(
+        q,
+        .{ .q = qk.q, .scales = qk.scales, .biases = qk.biases },
+        .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
+        4,
+        64,
+        4,
+        64,
+        .{ .ctx = null },
+        .{ .ctx = null },
+        scale,
+        "causal",
+        none_mask,
+        s,
+    );
+    defer _ = mlx.mlx_array_free(cand);
+
+    const ref_flat = try readF32Flat(s, ref, testing.allocator);
+    defer testing.allocator.free(ref_flat);
+    const cand_flat = try readF32Flat(s, cand, testing.allocator);
+    defer testing.allocator.free(cand_flat);
+    try testing.expectEqual(ref_flat.len, cand_flat.len);
+    var max_err: f32 = 0;
+    for (ref_flat, cand_flat) |r, c| {
+        const e = @abs(r - c);
+        if (e > max_err) max_err = e;
+    }
+    try testing.expect(max_err < 0.05);
+}
+
+test "preferTiledPrefill routes warm small-T_q to tiled, cold full-chunk to dense" {
+    // Ornith-ish dims: H_q=16, H_kv=4, hdim=128, 8 full-attn layers, 73k ctx.
+    const h_q: u64 = 16;
+    const h_kv: u64 = 4;
+    const hdim: u64 = 128;
+    const fa: u64 = 8;
+    const t_k: u64 = 73_251;
+    const block: u64 = 4096;
+    const saved = kv_attn_tiled_budget_mb;
+    kv_attn_tiled_budget_mb = 2048;
+    defer kv_attn_tiled_budget_mb = saved;
+
+    // Warm: 251 new tokens → tiled tile ≪ full-context dequant → tiled.
+    try testing.expect(preferTiledPrefill(h_q, h_kv, 251, block, t_k, fa, hdim));
+    // Cold: an 8192-token chunk → [H_q,8192,block] dwarfs the dequant AND blows
+    // the budget ceiling → dense.
+    try testing.expect(!preferTiledPrefill(h_q, h_kv, 8192, block, t_k, fa, hdim));
+    // Budget=0 disables the ceiling, but cold still loses the size comparison.
+    kv_attn_tiled_budget_mb = 0;
+    try testing.expect(!preferTiledPrefill(h_q, h_kv, 8192, block, t_k, fa, hdim));
+    try testing.expect(preferTiledPrefill(h_q, h_kv, 251, block, t_k, fa, hdim));
 }

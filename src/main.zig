@@ -101,16 +101,25 @@ fn printUsage(io: std.Io) void {
         \\                        combo is --kv-quant-k 8 --kv-quant-v turbo4.
         \\  --kv-attn-mode {{dense|fused}}
         \\                      Attention path for quantized KV. `dense`
-        \\                        (default) dequantizes K/V before SDPA;
-        \\                        `fused` consumes the quant triples directly
-        \\                        via mlx_quantized_matmul at DECODE (avoids the
-        \\                        dense-dequant spike at long context). Prefill
-        \\                        always uses flash SDPA. Effective at --kv-quant
-        \\                        4, 8, turbo2 or turbo4.
+        \\                        (default) dequantizes K/V before SDPA; `fused`
+        \\                        consumes the quant triples directly via
+        \\                        mlx_quantized_matmul through a K-tiled online
+        \\                        softmax — used at decode AND warm (small-T_q)
+        \\                        prefill, so multi-turn long-context never
+        \\                        re-dequantizes the context. A cold full-chunk
+        \\                        prefill still uses flash SDPA (its query-axis
+        \\                        tile is too big). Effective at --kv-quant 4, 8,
+        \\                        turbo2 or turbo4.
         \\  --kv-attn-block <n> K-tile size for the fused online-softmax
-        \\                        attention (default 4096). Bounds the attention
-        \\                        transient to O(block); smaller = flatter memory
-        \\                        but more dispatches.
+        \\                        attention (default 4096). The per-block scores
+        \\                        tile is O(H_q·T_q·block); smaller = flatter
+        \\                        memory but more dispatches.
+        \\  --kv-attn-tiled-budget <mb>
+        \\                      Ceiling (MB) on the tiled scores transient before
+        \\                        a prefill chunk is forced to dense SDPA instead
+        \\                        (default 2048, 0 = no ceiling). Lowering
+        \\                        --prefill-chunk under this routes even cold
+        \\                        prefill through the flat tiled path.
         \\  --prefix-cache-mem <n>{{KB,MB,GB}}
         \\                      Hot prefix cache KV-bytes budget (default: 2GB).
         \\                      Evicts LRU entries until the budget fits.
@@ -509,6 +518,13 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             kv_quant_mod.kv_attn_block = n;
+        } else if (std.mem.eql(u8, args[i], "--kv-attn-tiled-budget") and i + 1 < args.len) {
+            i += 1;
+            const n = std.fmt.parseInt(u32, args[i], 10) catch {
+                log.err("--kv-attn-tiled-budget: expected an integer MB ceiling (0 = none); got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+            kv_quant_mod.kv_attn_tiled_budget_mb = n;
         } else if (std.mem.eql(u8, args[i], "--idle-evict-secs") and i + 1 < args.len) {
             // Plan 05 Phase D: idle-tick eviction window. When set, the
             // inference loop's idle path evicts .ready entries (refcount==0)
