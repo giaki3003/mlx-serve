@@ -2237,7 +2237,22 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 load_req = sch.load_queue.orderedRemove(0);
             }
         }
-        for (cleanup_batch[0..cleanup_n]) |s| s.deinit();
+        for (cleanup_batch[0..cleanup_n]) |s| {
+            // Commit-on-cancel: a slot cancelled mid-stream (client disconnect
+            // during decode) is culled from `decoding` WITHOUT going through
+            // finishSlot, so its KV — a SUPERSET of any consume-on-restore entry
+            // it restored this turn (knob #3) — would be lost, forcing a cold
+            // re-prefill next turn (and an OOM at long context). Commit it here,
+            // on the inference thread while it's still alive, before teardown.
+            // `finished` slots already committed via finishSlot (so markFinished
+            // set finished=true — skip); errored slots must not; and
+            // commitSlotIfApplicable itself skips 0-token / pad-only / vision,
+            // so a cancel before the prefill produced a token is a safe no-op.
+            if (s.cancelled.load(.acquire) and !s.finished and s.error_code == null) {
+                commitSlotIfApplicable(sch, s);
+            }
+            s.deinit();
+        }
         if (vision_n > 0 or embed_n > 0) {
             for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
             for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
