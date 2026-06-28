@@ -120,6 +120,32 @@ fn printUsage(io: std.Io) void {
         \\                        tokenize results (default: 4). Skips re-
         \\                        rendering identical messages on warm reuse.
         \\                        0 disables.
+        \\  --prefill-chunk <n> Tokens per prefill chunk (default: 8192). Larger
+        \\                        keeps mid-size prompts single-chunk (fewer
+        \\                        eval/clear barriers) at higher peak activation
+        \\                        memory. Env MLX_SERVE_PREFILL_CHUNK wins.
+        \\  --prefill-trace     Force the [prefill-trace] line at info level
+        \\                        (chunks, eval/clear ms, compiled-forward status,
+        \\                        MTP/PLD flags). Already on at --log-level debug.
+        \\  --ssm-checkpoint-stride <n>
+        \\                      Tokens between SSM/conv-state snapshots during
+        \\                        hybrid (GatedDeltaNet/Mamba) prefill (default:
+        \\                        256). Smaller = finer warm prefix reuse but more
+        \\                        prefill sub-chunking; 0 disables (hybrid then
+        \\                        bypasses the hot cache).
+        \\  --ssm-checkpoint-max <n>
+        \\                      Max SSM checkpoints retained per request
+        \\                        (default: 32; 0 = unlimited).
+        \\  --perf-preset <name>
+        \\                      Bundle tuning knobs for a workload. One of:
+        \\                        cold-prefill   max raw prefill TPS (mtp/pld off,
+        \\                                       no caches, trace on)
+        \\                        coding-agent   single-user agent (warm caches,
+        \\                                       ssm-stride 2048)
+        \\                        low-memory     conservative 16GB (8-bit KV,
+        \\                                       small caches)
+        \\                        max-throughput multi-user (max-concurrent 4)
+        \\                      Flags passed AFTER --perf-preset override it.
         \\  --llama-cache-entries <n>
         \\                      For GGUF models served via llama.cpp, the max
         \\                        number of resident KV sessions (default: 4).
@@ -422,6 +448,28 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-max") and i + 1 < args.len) {
             i += 1;
             server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 32;
+        } else if (std.mem.eql(u8, args[i], "--perf-preset") and i + 1 < args.len) {
+            // perf/m5: bundle the individual tuning knobs into a workload
+            // starting point. Individual flags passed AFTER this override the
+            // preset (left-to-right parse). Nothing changes if absent. Does NOT
+            // touch the GPU wired/memory limit (see --wired-limit).
+            i += 1;
+            const p = server_mod.perfPresetFromString(args[i]) orelse {
+                log.err("--perf-preset: expected one of {{cold-prefill, coding-agent, low-memory, max-throughput}}; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+            generate_mod.prefill_chunk_override = p.prefill_chunk;
+            if (p.force_trace) generate_mod.prefill_trace_force = true;
+            server_mod.ssm_checkpoint_stride = p.ssm_checkpoint_stride;
+            server_mod.ssm_checkpoint_max = p.ssm_checkpoint_max;
+            server_mod.prefix_cache_capacity = p.prefix_cache_entries;
+            server_mod.prefix_cache_mem_bytes = p.prefix_cache_mem_bytes;
+            server_mod.tokenize_cache_entries = p.tokenize_cache_entries;
+            server_mod.max_concurrent = p.max_concurrent;
+            enable_mtp = p.enable_mtp;
+            enable_pld = p.enable_pld;
+            if (parseKvQuantArg(p.kv_quant)) |kq| kv_quant_config = kq;
+            log.info("[perf-preset] {s}: chunk={d} ssm_stride={d} prefix_entries={d} tok_cache={d} max_concurrent={d} mtp={} pld={} kv_quant={s}\n", .{ args[i], p.prefill_chunk, p.ssm_checkpoint_stride, p.prefix_cache_entries, p.tokenize_cache_entries, p.max_concurrent, p.enable_mtp, p.enable_pld, p.kv_quant });
         } else if (std.mem.eql(u8, args[i], "--llama-kv-quant") and i + 1 < args.len) {
             // Phase 5 #2: KV-cache quantization for the embedded llama.cpp
             // engine. Accepts `off`/`f16` (default; F16), `q8`/`8`/`Q8_0`

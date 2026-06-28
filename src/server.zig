@@ -469,6 +469,106 @@ pub var llama_kv_quant: arch_llama.LlamaKvQuant = .off;
 /// guard checks before enabling.
 pub var max_concurrent: u32 = 1;
 
+/// perf/m5: a `--perf-preset <name>` bundles the individual tuning knobs
+/// (prefill chunk, SSM stride, caches, spec-decode, concurrency, KV-quant)
+/// into a sane STARTING POINT for a workload, so users needn't remember the
+/// whole matrix. These are starting points for benchmarking on the target
+/// Mac, NOT proven optima. Individual flags passed AFTER --perf-preset on the
+/// command line override the preset (left-to-right parse). When --perf-preset
+/// is absent, nothing changes — every server default is exactly as before.
+/// NOTE: presets do NOT touch the GPU wired/memory limit; that has its own
+/// --wired-limit flag (mlx.configured_wired_limit / applyGpuLimit).
+pub const PerfPreset = struct {
+    prefill_chunk: usize,
+    ssm_checkpoint_stride: u32,
+    ssm_checkpoint_max: u32,
+    prefix_cache_entries: u32,
+    prefix_cache_mem_bytes: u64,
+    tokenize_cache_entries: u32,
+    max_concurrent: u32,
+    enable_mtp: bool,
+    enable_pld: bool,
+    kv_quant: []const u8,
+    force_trace: bool,
+};
+
+/// Resolve a preset name to its bundle, or null for an unknown name.
+pub fn perfPresetFromString(name: []const u8) ?PerfPreset {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const MB: u64 = 1024 * 1024;
+    if (std.mem.eql(u8, name, "cold-prefill")) {
+        // Max raw cold-prefill TPS for a single user / benchmark: biggest
+        // single-chunk window, NO SSM checkpointing (so prefill is never
+        // sub-divided at stride boundaries — hybrid then bypasses the hot
+        // cache, fine for a cold benchmark), no caches, no spec-decode prefill
+        // tax (MTP/PLD off), trace on.
+        return .{
+            .prefill_chunk = 16384,
+            .ssm_checkpoint_stride = 0,
+            .ssm_checkpoint_max = 0,
+            .prefix_cache_entries = 0,
+            .prefix_cache_mem_bytes = 0,
+            .tokenize_cache_entries = 0,
+            .max_concurrent = 1,
+            .enable_mtp = false,
+            .enable_pld = false,
+            .kv_quant = "off",
+            .force_trace = true,
+        };
+    } else if (std.mem.eql(u8, name, "coding-agent")) {
+        // Single-user agent (Claude Code / OpenCode): large chunk, mid SSM
+        // stride so warm prefix reuse still has mid-prompt restore points,
+        // generous prefix + tokenize caches. MTP/PLD on for decode speed.
+        return .{
+            .prefill_chunk = 16384,
+            .ssm_checkpoint_stride = 2048,
+            .ssm_checkpoint_max = 16,
+            .prefix_cache_entries = 32,
+            .prefix_cache_mem_bytes = 2 * GB,
+            .tokenize_cache_entries = 16,
+            .max_concurrent = 1,
+            .enable_mtp = true,
+            .enable_pld = true,
+            .kv_quant = "off",
+            .force_trace = false,
+        };
+    } else if (std.mem.eql(u8, name, "low-memory")) {
+        // Conservative for a 16 GB Mac: smaller chunk, coarse SSM stride + low
+        // checkpoint cap, tight prefix-cache budget, 8-bit KV.
+        return .{
+            .prefill_chunk = 8192,
+            .ssm_checkpoint_stride = 4096,
+            .ssm_checkpoint_max = 8,
+            .prefix_cache_entries = 8,
+            .prefix_cache_mem_bytes = 512 * MB,
+            .tokenize_cache_entries = 8,
+            .max_concurrent = 1,
+            .enable_mtp = true,
+            .enable_pld = true,
+            .kv_quant = "8",
+            .force_trace = false,
+        };
+    } else if (std.mem.eql(u8, name, "max-throughput")) {
+        // Multi-user concurrent serving: large chunk, warm caches, batched
+        // decode across up to 4 slots, big tokenize cache. Watch memory on
+        // 16 GB — drop --max-concurrent / --prefix-cache-mem if it OOMs.
+        return .{
+            .prefill_chunk = 16384,
+            .ssm_checkpoint_stride = 2048,
+            .ssm_checkpoint_max = 16,
+            .prefix_cache_entries = 32,
+            .prefix_cache_mem_bytes = 2 * GB,
+            .tokenize_cache_entries = 32,
+            .max_concurrent = 4,
+            .enable_mtp = true,
+            .enable_pld = true,
+            .kv_quant = "off",
+            .force_trace = false,
+        };
+    }
+    return null;
+}
+
 // Plan 05: vision encoder and model id moved to `LoadedModel.vision_encoder`
 // and `LoadedModel.id`. Handlers read them off `lm`. `global_vision_encoder`
 // and `global_model_id` singletons were removed. The `discovered_models`
@@ -10017,4 +10117,29 @@ test "optSamplingRecJson emits number when present, null when absent" {
     const none = try optSamplingRecJson(a, u32, null);
     defer a.free(none);
     try std.testing.expectEqualStrings("null", none);
+}
+
+test "perfPresetFromString bundles known presets and rejects unknown names" {
+    try std.testing.expect(perfPresetFromString("nope") == null);
+
+    const cold = perfPresetFromString("cold-prefill").?;
+    try std.testing.expect(!cold.enable_mtp and !cold.enable_pld);
+    try std.testing.expectEqual(@as(usize, 16384), cold.prefill_chunk);
+    try std.testing.expectEqual(@as(u32, 0), cold.ssm_checkpoint_stride);
+    try std.testing.expectEqual(@as(u32, 0), cold.tokenize_cache_entries);
+    try std.testing.expect(cold.force_trace);
+
+    const agent = perfPresetFromString("coding-agent").?;
+    try std.testing.expectEqual(@as(u32, 2048), agent.ssm_checkpoint_stride);
+    try std.testing.expectEqual(@as(u32, 16), agent.tokenize_cache_entries);
+    try std.testing.expect(agent.enable_mtp);
+
+    const low = perfPresetFromString("low-memory").?;
+    try std.testing.expectEqualStrings("8", low.kv_quant);
+    try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), low.prefix_cache_mem_bytes);
+    try std.testing.expectEqual(@as(u32, 1), low.max_concurrent);
+
+    const mt = perfPresetFromString("max-throughput").?;
+    try std.testing.expectEqual(@as(u32, 4), mt.max_concurrent);
+    try std.testing.expectEqual(@as(u32, 32), mt.tokenize_cache_entries);
 }
