@@ -107,10 +107,14 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ~1 token per "tokN " word for ASCII BPE; distinct words so the prompt isn't
-# collapsed by the n-gram spec-gate. The CSV records the EXACT tokens the trace
-# reports, so approximate generation is fine.
-make_prompt() { awk -v n="$1" 'BEGIN{ for (i=0;i<n;i++) printf "tok%d ", i }'; }
+# Generate ~N tokens. Use the single common word "the" (one BPE token as " the"
+# in Qwen/GPT-style tokenizers), so word count ~= token count and a size stays
+# UNDER ctx instead of over (an earlier "tok%d" generator produced ~2-3 tokens
+# per word, so a "16000" prompt was ~40k tokens and tripped the
+# prompt>ctx_size gate). Prefill compute is identical regardless of token
+# values, so repeated filler is a faithful N-token prefill. The CSV records the
+# EXACT token count from the trace, so any residual ratio drift is visible.
+make_prompt() { awk -v n="$1" 'BEGIN{ for (i=0;i<n;i++) printf "the " }'; }
 
 start_server() { # extra launch flags as args
   # Never run two servers at once — overlapping ~12 GB wired allocations are
