@@ -1915,6 +1915,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     }
 
     // Wire model weights into GPU memory (prevents paging, matches mlx-lm).
+    // P0a: lift the wired+memory ceiling per --wired-limit
+    // (mlx.configured_wired_limit) so long-context prefill doesn't OOM-abort
+    // at Metal's ~recommendedMaxWorkingSetSize wall on a 16 GB Mac.
     {
         var dev = mlx.mlx_device{ .ctx = null };
         _ = mlx.mlx_get_default_device(&dev);
@@ -1922,9 +1925,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (mlx.mlx_device_info_get(&info, dev) == 0) {
             var max_rec: usize = 0;
             if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") == 0 and max_rec > 0) {
-                var old_limit: usize = 0;
-                _ = mlx.mlx_set_wired_limit(&old_limit, max_rec);
-                log.debug("Wired limit set to {d} MB\n", .{max_rec / (1024 * 1024)});
+                const r = mlx.applyGpuLimit(max_rec);
+                log.info("Wired+memory limit: {d} MB -> {d} MB\n", .{ r.previous_wired / (1024 * 1024), r.applied / (1024 * 1024) });
             }
             _ = mlx.mlx_device_info_free(info);
         }

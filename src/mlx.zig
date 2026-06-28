@@ -317,6 +317,33 @@ pub extern "c" fn mlx_set_wired_limit(res: *usize, limit: usize) c_int;
 pub extern "c" fn mlx_get_active_memory(res: *usize) c_int;
 pub extern "c" fn mlx_get_peak_memory(res: *usize) c_int;
 pub extern "c" fn mlx_reset_peak_memory() c_int;
+/// Bytes held in MLX's reclaimable buffer cache (freed on memory pressure /
+/// `mlx_clear_cache`). Lets the admission check discount it from active memory
+/// instead of clear-then-remeasure. Present in mlx-c >= 0.6.0 / MLX 0.31.2.
+pub extern "c" fn mlx_get_cache_memory(res: *usize) c_int;
+
+/// Process-wide GPU wired-limit override in bytes. `0` = use the device's
+/// `max_recommended_working_set_size` (legacy behavior). Set once at startup
+/// from `--wired-limit`; read by `applyGpuLimit` (where the Metal limit is set)
+/// and by the server's admission-check ceiling so both agree.
+pub var configured_wired_limit: u64 = 0;
+
+pub const GpuLimitResult = struct { previous_wired: usize, applied: usize };
+
+/// Apply the GPU wired + memory limit, lifting Metal's default
+/// `recommendedMaxWorkingSetSize` wall so long-context prefill doesn't
+/// OOM-abort below physical RAM. Uses `configured_wired_limit` when set, else
+/// `device_recommended`. Caller logs the before→after (mlx.zig stays
+/// log-free). Setting both wired and memory limits to the same value matches
+/// ollama's MLX runner.
+pub fn applyGpuLimit(device_recommended: usize) GpuLimitResult {
+    const target: usize = if (configured_wired_limit > 0) @intCast(configured_wired_limit) else device_recommended;
+    var old_wired: usize = 0;
+    _ = mlx_set_wired_limit(&old_wired, target);
+    var old_mem: usize = 0;
+    _ = mlx_set_memory_limit(&old_mem, target);
+    return .{ .previous_wired = old_wired, .applied = target };
+}
 
 // ── Device info ──
 pub const mlx_device_info = extern struct { ctx: ?*anyopaque = null };

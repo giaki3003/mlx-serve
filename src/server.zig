@@ -1155,6 +1155,10 @@ fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
 /// oversubscribe. Falls back to `getMetalBufferLimit()` when the device query
 /// is unavailable (CI / non-Metal hosts).
 fn getGpuWorkingSetLimit() u64 {
+    // P0a: when --wired-limit raised the Metal ceiling, budget the admission
+    // check against the raised value (not the device's ~12GB recommendation),
+    // so we admit the long prompts the higher wired limit now actually allows.
+    if (mlx.configured_wired_limit > 0) return mlx.configured_wired_limit;
     var dev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&dev);
     var info = mlx.mlx_device_info_new();

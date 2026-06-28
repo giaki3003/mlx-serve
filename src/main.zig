@@ -145,6 +145,11 @@ fn printUsage(io: std.Io) void {
         \\                      Summed resident-bytes cap across all loaded
         \\                        models. Default 'auto' = 80% of MLX wired
         \\                        limit at startup. Pass 0 to disable.
+        \\  --wired-limit <n>{{KB,MB,GB}}|auto|off
+        \\                      Raise Metal's GPU working-set ceiling so long
+        \\                        context doesn't OOM-abort below physical RAM.
+        \\                        Default 'auto' = min(0.9*RAM, RAM-2GB); 'off'
+        \\                        keeps the device recommendation (~12GB/16GB).
         \\  --idle-evict-secs <n>
         \\                      Evict .ready entries with refcount==0 if
         \\                        idle for this many seconds. Default: off.
@@ -168,6 +173,26 @@ fn parseKvQuantArg(arg: []const u8) ?transformer_mod.KVQuantConfig {
     if (eql(u8, arg, "turbo2")) return transformer_mod.KVQuantConfig.turboquant(2);
     if (eql(u8, arg, "turbo4")) return transformer_mod.KVQuantConfig.turboquant(4);
     return null;
+}
+
+extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
+
+/// Physical RAM in bytes (`hw.memsize`), or 0 if the query fails.
+fn physicalRamBytes() u64 {
+    var mem: u64 = 0;
+    var len: usize = @sizeOf(u64);
+    _ = sysctlbyname("hw.memsize", @ptrCast(&mem), &len, null, 0);
+    return mem;
+}
+
+/// P0a auto wired-limit: `min(0.9*RAM, RAM-2GB)`. The 0.9 ratio caps large-RAM
+/// Macs; the RAM-2GB floor leaves OS headroom on a 16 GB machine. Returns 0
+/// (→ keep the device recommendation) when RAM is unknown or <= 2 GB.
+fn computeAutoWiredLimit() u64 {
+    const ram = physicalRamBytes();
+    const gb2: u64 = 2 * 1024 * 1024 * 1024;
+    if (ram <= gb2) return 0;
+    return @min(ram * 9 / 10, ram - gb2);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -230,6 +255,11 @@ pub fn main(init: std.process.Init) !void {
     // to `--kv-quant` when unset, so the symmetric case is unchanged.
     var kv_quant_k_override: ?transformer_mod.KVQuantConfig = null;
     var kv_quant_v_override: ?transformer_mod.KVQuantConfig = null;
+    // P0a: GPU wired-limit. `auto` (default) raises Metal's working-set ceiling
+    // to min(0.9*RAM, RAM-2GB); `off` keeps the device recommendation; an
+    // explicit size pins it. Applied at startup + used as the admission ceiling.
+    var wired_limit_mode: enum { auto, off, explicit } = .auto;
+    var wired_limit_value: u64 = 0;
     // Phase 2 (Plan ricky): fused attention reads K/V triples directly via
     // mlx_quantized_matmul instead of dequantizing through DenseKVView.
     // Off by default — supported for the affine AND TurboQuant schemes
@@ -412,6 +442,19 @@ pub fn main(init: std.process.Init) !void {
                 };
                 max_resident_mem_explicit = true;
             }
+        } else if (std.mem.eql(u8, args[i], "--wired-limit") and i + 1 < args.len) {
+            i += 1;
+            if (std.mem.eql(u8, args[i], "auto")) {
+                wired_limit_mode = .auto;
+            } else if (std.mem.eql(u8, args[i], "off") or std.mem.eql(u8, args[i], "0")) {
+                wired_limit_mode = .off;
+            } else {
+                wired_limit_value = parseSizeArg(args[i]) catch {
+                    log.err("--wired-limit: expected '<n>{{MB,GB,KB}}', 'auto', or 'off'; got '{s}'\n", .{args[i]});
+                    std.process.exit(1);
+                };
+                wired_limit_mode = .explicit;
+            }
         } else if (std.mem.eql(u8, args[i], "--idle-evict-secs") and i + 1 < args.len) {
             // Plan 05 Phase D: idle-tick eviction window. When set, the
             // inference loop's idle path evicts .ready entries (refcount==0)
@@ -580,6 +623,21 @@ pub fn main(init: std.process.Init) !void {
     }
     log.info("[args] kv-attn-mode: {s}\n", .{if (kv_attn_fused_default) "fused" else "dense"});
 
+    // P0a: resolve the GPU wired-limit and stash it process-wide. The actual
+    // mlx_set_wired_limit/mlx_set_memory_limit call happens at model-load time
+    // (offline block here / scheduler inference thread), and the server's
+    // admission ceiling (getGpuWorkingSetLimit) reads the same value.
+    mlx.configured_wired_limit = switch (wired_limit_mode) {
+        .auto => computeAutoWiredLimit(),
+        .off => 0,
+        .explicit => wired_limit_value,
+    };
+    if (mlx.configured_wired_limit > 0) {
+        log.info("[args] wired-limit: {d:.1} GB (raising Metal working-set ceiling)\n", .{@as(f64, @floatFromInt(mlx.configured_wired_limit)) / 1_073_741_824.0});
+    } else {
+        log.info("[args] wired-limit: device default (recommended working set)\n", .{});
+    }
+
     // Set GPU as default
     var metal_avail: bool = false;
     try mlx.check(mlx.mlx_metal_is_available(&metal_avail));
@@ -704,6 +762,11 @@ pub fn main(init: std.process.Init) !void {
         const effective_max_resident_mem: u64 = if (max_resident_mem_explicit)
             max_resident_mem
         else blk: {
+            // Mirror the wired limit (P0a): 80% of whatever ceiling is actually
+            // in force — the configured --wired-limit when set, else the
+            // device recommendation — so the registry eviction gate stays in
+            // sync with the raised ceiling.
+            if (mlx.configured_wired_limit > 0) break :blk mlx.configured_wired_limit * 4 / 5;
             var dev = mlx.mlx_device{ .ctx = null };
             _ = mlx.mlx_get_default_device(&dev);
             var info = mlx.mlx_device_info_new();
@@ -807,7 +870,9 @@ pub fn main(init: std.process.Init) !void {
             xfm.cache = try transformer_mod.KVCache.initWithKVConfigs(allocator, config.num_hidden_layers, kv_quant_pair.k, kv_quant_pair.v, config.head_dim);
         }
 
-        // JIT-compile + wire memory limits.
+        // JIT-compile + wire memory limits. P0a: lift the Metal working-set
+        // ceiling per --wired-limit (mlx.configured_wired_limit) so long-context
+        // prefill doesn't OOM-abort below physical RAM.
         {
             var dev = mlx.mlx_device{ .ctx = null };
             _ = mlx.mlx_get_default_device(&dev);
@@ -815,9 +880,8 @@ pub fn main(init: std.process.Init) !void {
             if (mlx.mlx_device_info_get(&info, dev) == 0) {
                 var max_rec: usize = 0;
                 if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") == 0 and max_rec > 0) {
-                    var old_limit: usize = 0;
-                    _ = mlx.mlx_set_wired_limit(&old_limit, max_rec);
-                    log.debug("Wired limit set to {d} MB\n", .{max_rec / (1024 * 1024)});
+                    const r = mlx.applyGpuLimit(max_rec);
+                    log.info("Wired+memory limit: {d} MB -> {d} MB\n", .{ r.previous_wired / (1024 * 1024), r.applied / (1024 * 1024) });
                 }
                 _ = mlx.mlx_device_info_free(info);
             }
