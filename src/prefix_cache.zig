@@ -210,6 +210,23 @@ pub const HotPrefixCache = struct {
         return null;
     }
 
+    /// Longest prefix (in tokens) that `prompt_ids` shares with ANY resident
+    /// entry, ignoring the has_tools/quant filters that `findBestMatch` applies
+    /// for restore correctness. This is a MEMORY ESTIMATE only — it answers
+    /// "how much of this prompt's KV is likely already resident" so the prefill
+    /// admission check doesn't double-count reused-prefix KV on warm multi-turn
+    /// requests. It never feeds an actual restore, so the relaxed match is safe.
+    pub fn maxResidentPrefix(self: *const HotPrefixCache, prompt_ids: []const u32) usize {
+        var best: usize = 0;
+        for (self.entries.items) |*e| {
+            const max_shared = @min(e.tokens.len, prompt_ids.len);
+            var shared: usize = 0;
+            while (shared < max_shared and e.tokens[shared] == prompt_ids[shared]) shared += 1;
+            if (shared > best) best = shared;
+        }
+        return best;
+    }
+
     /// Try to restore a matching entry into `target_cache`. On success, returns
     /// the matched prefix length. On miss, fully resets `target_cache` and
     /// returns 0. Caller should prefill the trailing tokens after this.

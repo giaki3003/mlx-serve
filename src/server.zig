@@ -1211,16 +1211,18 @@ fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
     const heads: u64 = config.num_attention_heads;
     if (heads == 0) return 16384;
 
-    const layers: u64 = config.num_hidden_layers;
+    // Only full-attention layers grow KV with seq; hybrid linear-attention
+    // layers keep a constant state (see ModelConfig.fullAttentionLayers).
+    const kv_layers: u64 = config.fullAttentionLayers();
     const kv_heads: u64 = config.num_key_value_heads;
     const hdim: u64 = config.head_dim;
     const hidden: u64 = config.hidden_size;
     const ffn: u64 = @max(config.intermediate_size, config.moe_intermediate_size + config.shared_expert_intermediate_size);
 
-    //   KV cache (fp16):   layers × 2 × kv_heads × head_dim × 2 bytes per token
+    //   KV cache (fp16):   full_attn_layers × 2 × kv_heads × head_dim × 2 bytes per token
     //   Working (fp16):    ~8 × max(hidden, ffn) × 2 bytes per token (per-layer tensors,
     //                      bounded by EVAL_EVERY_N_LAYERS in transformer.zig)
-    const kv_per_tok: u64 = layers * 2 * kv_heads * hdim * 2;
+    const kv_per_tok: u64 = kv_layers * 2 * kv_heads * hdim * 2;
     const work_per_tok: u64 = 8 * @max(hidden, ffn) * 2;
     const per_tok: u64 = kv_per_tok + work_per_tok;
 
@@ -1246,27 +1248,56 @@ fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
 /// that tiles over seq and never materializes the full [heads, seq, seq] attention matrix.
 /// So peak memory is dominated by (a) the persistent KV cache and (b) per-layer working
 /// tensors (QKV projections, MLP intermediates). There is no seq² term.
-fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len: usize, config: *const model_mod.ModelConfig, is_anthropic: bool) !bool {
+fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, config: *const model_mod.ModelConfig, is_anthropic: bool) !bool {
     const heads = config.num_attention_heads;
     if (heads == 0) return true; // unknown architecture, skip check
 
-    const seq: u64 = @intCast(prompt_len);
-    const layers: u64 = config.num_hidden_layers;
+    const prompt_len: usize = prompt_ids.len;
+    // Tokens already resident in the hot prefix cache (turn 2+ of a chat reuses
+    // turn 1's KV). That KV is already counted in active_mem below, so billing
+    // it again here double-counts and falsely rejects warm multi-turn requests
+    // ("needs 6GB, 2GB free" right after the same prompt loaded fine). Bill only
+    // the uncached tail. No cache match (cold request) => resident_prefix 0 =>
+    // bills the full prompt exactly as before. Relaxed token-prefix match
+    // (ignores the has_tools/quant restore filter) since this is only a memory
+    // estimate, not an actual restore.
+    var resident_prefix: usize = 0;
+    if (global_scheduler) |sch| {
+        if (sch.hot_prefix_cache) |hc| {
+            resident_prefix = hc.maxResidentPrefix(prompt_ids);
+        }
+    }
+    const seq: u64 = if (prompt_len > resident_prefix) @intCast(prompt_len - resident_prefix) else 0;
     const kv_heads: u64 = config.num_key_value_heads;
     const hdim: u64 = config.head_dim;
     const hidden: u64 = config.hidden_size;
     const ffn: u64 = @max(config.intermediate_size, config.moe_intermediate_size + config.shared_expert_intermediate_size);
 
-    // KV cache (all layers, fp16): layers × 2(K+V) × seq × kv_heads × head_dim × 2 bytes.
-    // This is persistent for the rest of the request, so it's a real hard cost.
-    const kv_bytes: u64 = layers * 2 * seq * kv_heads * hdim * 2;
-    // Per-layer working memory during prefill (fp16). The transformer eval()s every N layers,
-    // so transient tensors from earlier layers are released. Peak is bounded by a single layer:
-    //   QKV projections (~3× seq × hidden) + MLP intermediates (~3× seq × ffn) + residuals.
-    // A ~8× seq × max(hidden, ffn) × 2-byte envelope captures this with headroom.
-    const working_bytes: u64 = 8 * seq * @max(hidden, ffn) * 2;
+    // KV cache (fp16). Only FULL-attention layers grow with seq. On hybrid
+    // (GatedDeltaNet) models the linear-attention layers keep a constant
+    // recurrent/conv state that does NOT scale with seq — counting all
+    // num_hidden_layers here (the old formula) overcounts KV by
+    // num_hidden_layers/full_attention_layers (4× on Qwen3.5: 32 vs 8) and
+    // rejected long prompts that actually fit (e.g. 100k on 16GB, which
+    // llama.cpp serves fine). For non-hybrid models fullAttentionLayers()
+    // == num_hidden_layers, so this is unchanged.
+    const full_attn_layers: u64 = config.fullAttentionLayers();
+    const linear_layers: u64 = config.num_hidden_layers - full_attn_layers;
+    const kv_bytes: u64 = full_attn_layers * 2 * seq * kv_heads * hdim * 2;
+    // Constant per-linear-layer state (GatedDeltaNet recurrent S + conv), fp32,
+    // seq-INDEPENDENT. Small but real; included so we don't undercount.
+    const ssm_state_bytes: u64 = linear_layers *
+        (@as(u64, config.linear_num_value_heads) * config.linear_key_head_dim * config.linear_value_head_dim * 4 +
+        @as(u64, config.linear_num_key_heads) * config.linear_key_head_dim * config.linear_conv_kernel_dim * 4);
+    // Working memory during prefill (fp16) is bounded by the PREFILL CHUNK, not
+    // the full prompt: prefill runs in chunks of prefill_chunk_override
+    // (default 8192), eval()ing per chunk so transient QKV/MLP tensors release
+    // between chunks. Using `seq` here was the second overcount — a 100k prompt
+    // was billed 100k× working set when the real peak is one chunk's worth.
+    const chunk: u64 = @min(seq, @as(u64, generate_mod.prefill_chunk_override));
+    const working_bytes: u64 = 8 * chunk * @max(hidden, ffn) * 2;
     // Total estimate with 25% safety margin
-    const needed: u64 = (kv_bytes + working_bytes) * 5 / 4;
+    const needed: u64 = (kv_bytes + ssm_state_bytes + working_bytes) * 5 / 4;
 
     // Available = GPU working-set ceiling minus current usage (model weights,
     // resident hot-cache KV, etc.). Uses the same real Metal limit as the
@@ -1280,7 +1311,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     if (needed > available) {
         const needed_mb = needed / (1024 * 1024);
         const avail_mb = available / (1024 * 1024);
-        log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin), ~{d}MB available — rejecting\n", .{ prompt_len, needed_mb, avail_mb });
+        log.warn("  prompt {d} tokens ({d} uncached after prefix cache) needs ~{d}MB (KV+working+margin), ~{d}MB available — rejecting\n", .{ prompt_len, prompt_len - resident_prefix, needed_mb, avail_mb });
         const msg = try std.fmt.allocPrint(allocator,
             "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB available. Reduce prompt size or use a smaller model.", .{ prompt_len, needed_mb, avail_mb });
         defer allocator.free(msg);
@@ -2755,7 +2786,7 @@ fn handleChatCompletions(
     }
 
     // Check if attention computation would exceed GPU memory
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, config, false)) return;
 
     // Clamp max_tokens to stay within context window
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
@@ -3005,7 +3036,7 @@ fn handleCompletions(
     }
 
     // Check if attention computation would exceed GPU memory
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, config, false)) return;
 
     // Clamp max_tokens to stay within context window
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
@@ -6180,7 +6211,7 @@ fn handleAnthropicMessages(
     }
 
     // Check if attention computation would exceed GPU memory
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, true)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, config, true)) return;
 
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
@@ -7522,7 +7553,7 @@ fn handleResponses(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Prompt exceeds maximum context length", 400);
         return;
     }
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, config, false)) return;
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
 
     // ── sampling ──

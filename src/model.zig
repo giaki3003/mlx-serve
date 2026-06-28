@@ -285,6 +285,20 @@ pub const ModelConfig = struct {
         return ((layer_idx + 1) % self.full_attention_interval) != 0;
     }
 
+    /// Number of layers that hold a sequence-growing KV cache. For hybrid
+    /// (GatedDeltaNet) models only the full-attention layers grow with seq;
+    /// the linear-attention layers keep a constant recurrent/conv state. For
+    /// non-hybrid models (full_attention_interval == 0) this is all layers.
+    pub fn fullAttentionLayers(self: ModelConfig) u32 {
+        if (self.full_attention_interval == 0) return self.num_hidden_layers;
+        var n: u32 = 0;
+        var i: u32 = 0;
+        while (i < self.num_hidden_layers) : (i += 1) {
+            if (!self.isLinearLayer(i)) n += 1;
+        }
+        return n;
+    }
+
     pub fn isMoe(self: *const ModelConfig) bool {
         return self.num_experts > 0;
     }
