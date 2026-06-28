@@ -793,6 +793,7 @@ pub const Generator = struct {
             const default_chunk = if (has_vision) prefix_len else PREFILL_CHUNK;
 
             var pos: usize = 0;
+            var last_progress: usize = 0;
             while (pos < prefix_len) {
                 // Abandoned-request abort: the client disconnected and the
                 // conn thread flagged the slot. Bail before the next chunk —
@@ -929,6 +930,20 @@ pub const Generator = struct {
                         var oldest = ssm_checkpoints.orderedRemove(0);
                         oldest.deinit(allocator);
                     }
+                }
+
+                // Live prefill progress (llama.cpp-style). Cadence follows the
+                // chunk size; throttled to ~4k tokens so a small --prefill-chunk
+                // doesn't spam, and always emits the final chunk.
+                if (end - last_progress >= 4096 or end == prefix_len) {
+                    last_progress = end;
+                    const elapsed_ns = prefill_sw.read();
+                    const tps: f64 = if (elapsed_ns > 0)
+                        @as(f64, @floatFromInt(end)) * 1e9 / @as(f64, @floatFromInt(elapsed_ns))
+                    else
+                        0;
+                    const pct: f64 = @as(f64, @floatFromInt(end)) * 100.0 / @as(f64, @floatFromInt(prefix_len));
+                    log.info("  prompt processing: {d} / {d} tokens ({d:.0}%, {d:.1} tok/s)\n", .{ end, prefix_len, pct, tps });
                 }
 
                 pos = end;
