@@ -96,8 +96,8 @@ fn printUsage(io: std.Io) void {
         \\                      Attention path for quantized KV. `dense`
         \\                        (default) dequantizes K/V before SDPA;
         \\                        `fused` consumes the quant triples directly
-        \\                        via mlx_quantized_matmul (opt-in; only
-        \\                        effective at --kv-quant 4 or 8).
+        \\                        via mlx_quantized_matmul (opt-in; effective
+        \\                        at --kv-quant 4, 8, turbo2 or turbo4).
         \\  --prefix-cache-mem <n>{{KB,MB,GB}}
         \\                      Hot prefix cache KV-bytes budget (default: 2GB).
         \\                      Evicts LRU entries until the budget fits.
@@ -208,8 +208,9 @@ pub fn main(init: std.process.Init) !void {
     var kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense;
     // Phase 2 (Plan ricky): fused attention reads K/V triples directly via
     // mlx_quantized_matmul instead of dequantizing through DenseKVView.
-    // Off by default — only `.affine` cache scheme is supported by the
-    // v1 fused path; TurboQuant + dense schemes ignore it.
+    // Off by default — supported for the affine AND TurboQuant schemes
+    // (fused-turbo undoes the Hadamard rotation inside quantAttention); the
+    // dense (.off) scheme has no quant triple to consume and ignores it.
     var kv_attn_fused_default: bool = false;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
     // 32–64 GB systems running Gemma 4 E4B-class models". Override via the

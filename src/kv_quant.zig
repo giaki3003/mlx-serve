@@ -475,6 +475,15 @@ pub const BorrowedTriple = struct {
 ///   * "":       no mask.
 ///   * "array":  add `mask_arr` to the pre-softmax scores. Must be
 ///               additive (mlx convention: -inf for masked positions).
+///
+/// `rk`/`rv` are the optional per-side Hadamard rotation matrices for the
+/// TurboQuant schemes (fused-turbo path). When K is turbo, its triple holds
+/// `quantize(K @ Rk)`, and the score `Q·Kᵀ` is rotation-invariant, so we
+/// rotate `Q` by `Rk` before the K matmul: `(Q@Rk)·(K@Rk) = Q·K`. When V is
+/// turbo, its triple holds `quantize(V @ Rv)`, so the fused product
+/// `P @ dequant(qV) = (P@V) @ Rv`; we undo it by rotating the output through
+/// `Rvᵀ` (= `Rv`, since the matrices are symmetric+orthogonal). Pass
+/// `.{ .ctx = null }` for either when that side is plain affine (no rotation).
 /// Returns a `[B, H, T_q, D]` bf16 array; caller owns and frees.
 pub fn quantAttention(
     q_dense: mlx.mlx_array,
@@ -482,6 +491,8 @@ pub fn quantAttention(
     v_triple: BorrowedTriple,
     bits: u8,
     group_size: u32,
+    rk: mlx.mlx_array,
+    rv: mlx.mlx_array,
     scale: f32,
     mask_mode: []const u8,
     mask_arr: mlx.mlx_array,
@@ -553,13 +564,26 @@ pub fn quantAttention(
         owns_v_bi = true;
     }
 
+    // 0) fused-turbo: rotate Q into K's stored (Hadamard) basis. No-op when
+    //    `rk.ctx == null` (affine K). Independent of the GQA expansion above:
+    //    `rk` is `[D, D]` and broadcasts over the head dim.
+    var q_used = q_dense;
+    var owns_q = false;
+    defer {
+        if (owns_q) _ = mlx.mlx_array_free(q_used);
+    }
+    if (rk.ctx != null) {
+        q_used = try rotateLastDim(s, q_dense, rk);
+        owns_q = true;
+    }
+
     // 1) scores = Q @ K^T. transpose_w=true contracts on K's quantized
     //    last axis (D), the same dim Q contracts. Output: [B, H, T_q, T_k].
     var scores = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(scores);
     try mlx.check(mlx.mlx_quantized_matmul(
         &scores,
-        q_dense,
+        q_used,
         k_q_used,
         k_sc_used,
         k_bi_used,
@@ -659,6 +683,15 @@ pub fn quantAttention(
         "affine",
         s,
     ));
+
+    // 6) fused-turbo: undo V's stored rotation. `out = (P@V) @ Rv`, so
+    //    rotating by `Rv` (= `Rvᵀ`) recovers `P@V`. No-op when `rv.ctx ==
+    //    null` (affine V).
+    if (rv.ctx != null) {
+        const out_rot = try rotateLastDim(s, out, rv);
+        _ = mlx.mlx_array_free(out);
+        return out_rot;
+    }
     return out;
 }
 
@@ -1109,6 +1142,8 @@ test "quantAttention matches dense SDPA at 4-bit (decode, T_q=1)" {
         .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
         4,
         64,
+        .{ .ctx = null },
+        .{ .ctx = null },
         scale,
         "",
         none_mask,
@@ -1175,6 +1210,8 @@ test "quantAttention causal mask matches dense SDPA (prefill, T_q=T_k=4)" {
         .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
         4,
         64,
+        .{ .ctx = null },
+        .{ .ctx = null },
         scale,
         "causal",
         none_mask,
@@ -1186,6 +1223,146 @@ test "quantAttention causal mask matches dense SDPA (prefill, T_q=T_k=4)" {
     defer testing.allocator.free(ref_flat);
     const cand_flat = try readF32Flat(s, cand, testing.allocator);
     defer testing.allocator.free(cand_flat);
+    var max_err: f32 = 0;
+    for (ref_flat, cand_flat) |r, c| {
+        const e = @abs(r - c);
+        if (e > max_err) max_err = e;
+    }
+    try testing.expect(max_err < 0.05);
+}
+
+// ── Fused-turbo validation (Feature 1) ──
+//
+// These two tests are the correctness gate for fused-turbo. They store K/V
+// exactly as the cache's turbo write path does (`quantize(K@Rk)` /
+// `quantize(V@Rv)` with DISTINCT Rk, Rv) and assert that `quantAttention`
+// fed the rotated triples + Rk/Rv reproduces the known-good dense-turbo path
+// (dequantize+un-rotate → `mlx_fast_scaled_dot_product_attention`). The
+// rotations are orthogonal/exact, so any error beyond the bf16-reduction
+// tolerance means a transpose/orientation bug in the Q-in or output rotation —
+// precisely the silent-garbage failure mode the handover warns about.
+
+test "fused-turbo quantAttention matches dense-turbo SDPA (decode, T_q=1)" {
+    const s = mlx.gpuStream();
+    const B: c_int = 1;
+    const H: c_int = 2;
+    const T_k: c_int = 8;
+    const D: c_int = 64;
+    const q = try buildSmoothBHTD(s, B, H, 1, D);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = try buildSmoothBHTD(s, B, H, T_k, D);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = try buildSmoothBHTD(s, B, H, T_k, D);
+    defer _ = mlx.mlx_array_free(v_dense);
+
+    // Distinct K and V rotations — the fused-turbo correctness hinge (Rk != Rv).
+    var ts = try TurboState.initHadamard(testing.allocator, s, 1, @intCast(D));
+    defer ts.deinit();
+    const rk = ts.rk[0];
+    const rv = ts.rv[0];
+
+    var qk = try quantizeTurbo(s, k_dense, rk, 64, 4);
+    defer qk.deinit();
+    var qv = try quantizeTurbo(s, v_dense, rv, 64, 4);
+    defer qv.deinit();
+
+    const k_ref = try dequantizeTurbo(s, qk.q, qk.scales, qk.biases, rk, 64, 4);
+    defer _ = mlx.mlx_array_free(k_ref);
+    const v_ref = try dequantizeTurbo(s, qv.q, qv.scales, qv.biases, rv, 64, 4);
+    defer _ = mlx.mlx_array_free(v_ref);
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    var ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref);
+    const none_mask = mlx.mlx_array{ .ctx = null };
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(
+        &ref, q, k_ref, v_ref, scale, "", none_mask, .{ .ctx = null }, s,
+    ));
+
+    const cand = try quantAttention(
+        q,
+        .{ .q = qk.q, .scales = qk.scales, .biases = qk.biases },
+        .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
+        4,
+        64,
+        rk,
+        rv,
+        scale,
+        "",
+        none_mask,
+        s,
+    );
+    defer _ = mlx.mlx_array_free(cand);
+
+    const ref_flat = try readF32Flat(s, ref, testing.allocator);
+    defer testing.allocator.free(ref_flat);
+    const cand_flat = try readF32Flat(s, cand, testing.allocator);
+    defer testing.allocator.free(cand_flat);
+    try testing.expectEqual(ref_flat.len, cand_flat.len);
+    var max_err: f32 = 0;
+    for (ref_flat, cand_flat) |r, c| {
+        const e = @abs(r - c);
+        if (e > max_err) max_err = e;
+    }
+    try testing.expect(max_err < 0.05);
+}
+
+test "fused-turbo quantAttention matches dense-turbo SDPA (causal, Rk != Rv)" {
+    const s = mlx.gpuStream();
+    const B: c_int = 1;
+    const H: c_int = 2;
+    const T: c_int = 4;
+    const D: c_int = 64;
+    const q = try buildSmoothBHTD(s, B, H, T, D);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = try buildSmoothBHTD(s, B, H, T, D);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = try buildSmoothBHTD(s, B, H, T, D);
+    defer _ = mlx.mlx_array_free(v_dense);
+
+    var ts = try TurboState.initHadamard(testing.allocator, s, 1, @intCast(D));
+    defer ts.deinit();
+    const rk = ts.rk[0];
+    const rv = ts.rv[0];
+
+    var qk = try quantizeTurbo(s, k_dense, rk, 64, 4);
+    defer qk.deinit();
+    var qv = try quantizeTurbo(s, v_dense, rv, 64, 4);
+    defer qv.deinit();
+
+    const k_ref = try dequantizeTurbo(s, qk.q, qk.scales, qk.biases, rk, 64, 4);
+    defer _ = mlx.mlx_array_free(k_ref);
+    const v_ref = try dequantizeTurbo(s, qv.q, qv.scales, qv.biases, rv, 64, 4);
+    defer _ = mlx.mlx_array_free(v_ref);
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    var ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref);
+    const none_mask = mlx.mlx_array{ .ctx = null };
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(
+        &ref, q, k_ref, v_ref, scale, "causal", none_mask, .{ .ctx = null }, s,
+    ));
+
+    const cand = try quantAttention(
+        q,
+        .{ .q = qk.q, .scales = qk.scales, .biases = qk.biases },
+        .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
+        4,
+        64,
+        rk,
+        rv,
+        scale,
+        "causal",
+        none_mask,
+        s,
+    );
+    defer _ = mlx.mlx_array_free(cand);
+
+    const ref_flat = try readF32Flat(s, ref, testing.allocator);
+    defer testing.allocator.free(ref_flat);
+    const cand_flat = try readF32Flat(s, cand, testing.allocator);
+    defer testing.allocator.free(cand_flat);
+    try testing.expectEqual(ref_flat.len, cand_flat.len);
     var max_err: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
         const e = @abs(r - c);

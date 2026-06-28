@@ -250,8 +250,10 @@ pub const DenseKVView = struct {
     owned: bool,
 
     /// Borrowed quant triples. Set to `.ctx = null` when not applicable
-    /// (scheme == .off, or scheme is a TurboQuant variant — those need
-    /// the rotation undo step which the v1 fused path doesn't implement).
+    /// (scheme == .off). For both affine and the TurboQuant schemes the triple
+    /// holds the stored quant codes (TurboQuant stores them in the rotated
+    /// Hadamard basis); TurboQuant additionally sets `k_rot`/`v_rot` below so
+    /// the fused path can rotate Q in and the attention output out.
     /// Read-only; the cache owns these handles.
     k_triple_q: mlx.mlx_array = .{ .ctx = null },
     k_triple_scales: mlx.mlx_array = .{ .ctx = null },
@@ -259,6 +261,14 @@ pub const DenseKVView = struct {
     v_triple_q: mlx.mlx_array = .{ .ctx = null },
     v_triple_scales: mlx.mlx_array = .{ .ctx = null },
     v_triple_biases: mlx.mlx_array = .{ .ctx = null },
+    /// Borrowed per-side Hadamard rotation matrices for the TurboQuant
+    /// schemes. `.ctx = null` for affine / off (no rotation). When set, the
+    /// fused path rotates Q by `k_rot` before the K matmul and the attention
+    /// output by `v_rot` after the V matmul (both undo the rotation the cache
+    /// applied at write time). Owned by the cache's `TurboState` (immutable
+    /// post-build); these are non-owning borrows, never freed by `deinit`.
+    k_rot: mlx.mlx_array = .{ .ctx = null },
+    v_rot: mlx.mlx_array = .{ .ctx = null },
     /// True iff the triple fields above are populated. Lets call sites
     /// avoid checking `.ctx == null` on every field.
     has_quant_triple: bool = false,
@@ -471,9 +481,36 @@ pub const KVCache = struct {
         try mlx.check(mlx.mlx_matmul(&dense_v, rotated_view.v, rv, s));
 
         // Free the temporary rotated-basis dense view; we own a fresh one.
+        // `deinit` only frees the owned dense K/V — the borrowed triple views
+        // it carries belong to `self.entries[layer]` and stay alive, so we can
+        // re-expose them below.
         var rv_mut = rotated_view;
         rv_mut.deinit();
-        return .{ .k = dense_k, .v = dense_v, .owned = true };
+
+        // Expose the rotated-basis quant triples + the per-side rotation
+        // matrices so a fused-attn call site (`ctx.kv_attn_fused`) can consume
+        // K/V directly via `kv_quant.quantAttention` and skip the dense
+        // materialization. mlx is lazy: the `dense_k`/`dense_v` rotate-backs
+        // above stay unevaluated unless the dense fallback actually reads them,
+        // so the fused path pays no dequant spike. The fused path rotates Q by
+        // `rk` and the attention output by `rv` to undo the stored rotation.
+        const entry = &self.entries[layer];
+        return .{
+            .k = dense_k,
+            .v = dense_v,
+            .owned = true,
+            .k_triple_q = entry.key_view,
+            .k_triple_scales = entry.key_scales_view,
+            .k_triple_biases = entry.key_biases_view,
+            .v_triple_q = entry.value_view,
+            .v_triple_scales = entry.value_scales_view,
+            .v_triple_biases = entry.value_biases_view,
+            .k_rot = rk,
+            .v_rot = rv,
+            .has_quant_triple = true,
+            .bits = self.config.bits,
+            .group_size = self.config.group_size,
+        };
     }
 
     /// Variant of `updateAffine` that returns the rotated-basis dense view
@@ -739,7 +776,25 @@ pub const KVCache = struct {
                 const dense_k = try kv_quant.dequantizeTurbo(s, entry.key_view, entry.key_scales_view, entry.key_biases_view, rk, self.config.group_size, self.config.bits);
                 errdefer _ = mlx.mlx_array_free(dense_k);
                 const dense_v = try kv_quant.dequantizeTurbo(s, entry.value_view, entry.value_scales_view, entry.value_biases_view, rv, self.config.group_size, self.config.bits);
-                return .{ .k = dense_k, .v = dense_v, .owned = true };
+                // Expose the rotated-basis triples + rotations for the fused
+                // path (mirrors `updateTurboQuant`); dense K/V above stay lazy
+                // and unevaluated when a fused call site consumes the triples.
+                return .{
+                    .k = dense_k,
+                    .v = dense_v,
+                    .owned = true,
+                    .k_triple_q = entry.key_view,
+                    .k_triple_scales = entry.key_scales_view,
+                    .k_triple_biases = entry.key_biases_view,
+                    .v_triple_q = entry.value_view,
+                    .v_triple_scales = entry.value_scales_view,
+                    .v_triple_biases = entry.value_biases_view,
+                    .k_rot = rk,
+                    .v_rot = rv,
+                    .has_quant_triple = true,
+                    .bits = self.config.bits,
+                    .group_size = self.config.group_size,
+                };
             },
         }
     }
@@ -1533,10 +1588,10 @@ pub const ForwardCtx = struct {
     mrope_sin_cur: ?mlx.mlx_array = null,
     /// Phase 2 (Plan ricky): when true, attention call sites consume the
     /// cache's quantized K/V triples directly via `kv_quant.quantAttention`
-    /// instead of dequantizing through `DenseKVView`. Only effective when
-    /// the cache scheme is .affine — TurboQuant + .off ignore this flag
-    /// (TurboQuant needs the rotation undo step, which the fused path
-    /// doesn't yet implement; .off has no quant triple to consume).
+    /// instead of dequantizing through `DenseKVView`. Effective for the affine
+    /// AND TurboQuant schemes — fused-turbo undoes the stored Hadamard rotation
+    /// inside `quantAttention` via the view's `k_rot`/`v_rot` matrices. `.off`
+    /// ignores the flag (no quant triple to consume).
     /// Default false → unchanged dense SDPA path.
     kv_attn_fused: bool = false,
     /// Batched-embeddings: additive key-padding mask [B, 1, 1, T] consumed
@@ -3915,6 +3970,8 @@ pub const Transformer = struct {
                     kv_view.vTriple(),
                     kv_view.bits,
                     kv_view.group_size,
+                    kv_view.k_rot,
+                    kv_view.v_rot,
                     attn_scale,
                     sel_mode,
                     sel_mask,
@@ -5801,6 +5858,8 @@ pub const Transformer = struct {
                 kv_view.vTriple(),
                 kv_view.bits,
                 kv_view.group_size,
+                kv_view.k_rot,
+                kv_view.v_rot,
                 attn_scale,
                 sel_mode_moe,
                 none_mask,
