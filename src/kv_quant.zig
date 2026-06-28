@@ -475,24 +475,35 @@ pub fn dequantizeAffine(
 // single Metal pass — same primitive `qmatmulBits` already uses for weight
 // quantization throughout `transformer.zig`.
 //
-// Tradeoff vs `mlx_fast_scaled_dot_product_attention` (flash-attention):
-//   * Dense SDPA fuses Q@K^T → scale → mask → softmax → @V into a single
-//     tiled pass with no intermediate HBM writes. Wins at short context.
-//   * Hand-rolled qmm × 2 + softmax loses tile-level fusion but skips the
-//     dense K/V materialization. Wins at long context where K/V bandwidth
-//     dominates.
-// The crossover is data-driven; v1 ships behind `--kv-attn-mode fused` so the
-// default is unchanged.
+// Memory shape — the load-bearing caveat. This is NOT flash attention: it
+// MATERIALIZES the full [T_q, T_k] score matrix (qmm → softmax → qmm), an
+// O(T_q × T_k) transient. `mlx_fast_scaled_dot_product_attention` tiles and
+// never forms it.
+//   * DECODE (T_q == 1): the score row is [1, T_k] — tiny. Fused wins cleanly:
+//     flat memory, no dense-KV dequant spike each step. This is the intended
+//     use; `ctx.kv_attn_fused` is gated to decode at the call sites.
+//   * PREFILL (T_q == chunk): [chunk, T_k] is multi-GB at long context, so
+//     prefill uses flash SDPA over DEQUANTIZED K/V instead. But that only
+//     RELOCATES the transient — flash must first materialize the full f16 K/V
+//     (the dense-dequant spike), also O(T_k). So large-context prefill is still
+//     O(ctx); on a 16 GB Mac the ceiling is ~90–120k either way (both ride the
+//     same wall; fused just trades a scores-blob for a dequant-blob).
+//
+// THE REAL FIX (roadmap): a K-TILED online-softmax loop — walk K/V in blocks,
+// dequant per block, accumulate a running (max, sum, output), never holding the
+// full scores or the full dense KV. Peak becomes O(block), context-independent,
+// killing this OOM class for BOTH prefill and decode and letting the decode-only
+// gate be removed. That's the "Fused quant-attention Metal kernel" TODO; a
+// manual Zig online-softmax loop is the interim that needs no custom kernel.
 //
 // Shape contract:
 //   q_dense      : [B, H,    T_q, D] bf16 (Q already scaled or not; we apply scale below)
 //   k_q/sc/bi    : K affine-quantized along last axis (D). Shape of the
 //                  triple is whatever `mlx_quantize` produced.
 //   v_q/sc/bi    : V same as K.
-// GQA: when H > H_kv, `mlx_quantized_matmul` is responsible for
-// broadcasting the leading head dim — same way `mlx_matmul` does. If the
-// model uses head ratios that aren't natively supported, callers should
-// expand K/V (or fall through to the dense path) before invoking this.
+// GQA: H_q > H_kv is handled by FOLDING the `repeats` group into Q's row axis
+// (see `quantAttention`) — K/V pass through `mlx_quantized_matmul` untouched at
+// their native H_kv, no expansion or copy.
 
 /// A read-only borrow of a `QuantizedKV` triple — the cache owns the
 /// arrays; the call site borrows them for the duration of one attention.
