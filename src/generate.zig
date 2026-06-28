@@ -228,6 +228,32 @@ pub fn effectiveSsmCheckpointStride(base: usize, is_moe: bool, prefill_chunk: us
     return base;
 }
 
+/// Instrumentation: human-readable reason the compiled full-forward fast path
+/// was (or wasn't) taken during prefill. Mirrors the chunk-loop gate in `init`
+/// exactly, in the same precedence order, so the `[prefill-trace] compiled=...`
+/// field reports the truth. "USED" means every gate condition passed.
+///
+/// In `--serve` mode `cache_aliased` (`ctx.cache == &xfm.cache`) is false by
+/// default because the scheduler gives every slot its own KVCache, so the
+/// honest answer there is normally "per-slot-cache" — which is exactly the
+/// signal this field exists to surface.
+pub fn compiledForwardStatus(
+    has_compiled: bool,
+    mtp_active: bool,
+    cache_aliased: bool,
+    ssm_match: bool,
+    capture_hidden: bool,
+    vision: bool,
+) []const u8 {
+    if (!has_compiled) return "off (no compiled closure)";
+    if (mtp_active) return "skipped: mtp-active";
+    if (!cache_aliased) return "skipped: per-slot-cache (ctx.cache != &xfm.cache)";
+    if (!ssm_match) return "skipped: ssm-entries-mismatch";
+    if (capture_hidden) return "skipped: capture-hidden";
+    if (vision) return "skipped: vision";
+    return "USED";
+}
+
 /// Number of chunks a cold prefill of `prefix_len` tokens splits into for the
 /// given chunk size / SSM-checkpoint stride. Mirrors the loop in `init` exactly
 /// (drives the same `nextChunkEnd`), so a test on this is a faithful proxy for
@@ -741,7 +767,16 @@ pub const Generator = struct {
         var prefill_sw = io_util.Stopwatch.init(io);
         var chunked_ns: u64 = 0;
         var eval_ns: u64 = 0;
+        var clear_ns: u64 = 0;
         var n_chunks: usize = 0;
+        // Instrumentation only: records whether the compiled full-forward fast
+        // path was taken this prefill and, if not, WHICH gate condition blocked
+        // it (generate.zig chunk gate). Answers "is MLX_SERVE_COMPILE_FORWARD /
+        // --compile-forward actually doing anything in --serve mode?" — the
+        // per-slot cache makes `ctx.cache == &xfm.cache` false by default, so
+        // the honest answer for the server path is usually "per-slot-cache".
+        // Set on the first chunk; read only under `trace_enabled` below.
+        var compiled_status: []const u8 = "n/a (no prefill chunks)";
 
         // Phase 1: SSM checkpointing during prefill. When enabled, the chunked
         // prefill loop forces a chunk boundary at every multiple of
@@ -838,6 +873,19 @@ pub const Generator = struct {
                 };
                 var chunk_hidden_all = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(chunk_hidden_all);
+                // Capture WHY the compiled fast path was/wasn't taken (first
+                // chunk only; the gate conditions are loop-invariant during a
+                // prefill). Mirrors the `if` gate immediately below.
+                if (trace_enabled and n_chunks == 0) {
+                    compiled_status = compiledForwardStatus(
+                        xfm.compiled_forward != null,
+                        mtp_active,
+                        ctx.cache == &xfm.cache,
+                        ssm_match,
+                        ctx.capture_hidden != null,
+                        ctx.vision_embeddings != null,
+                    );
+                }
                 const chunk_logits = if (xfm.compiled_forward != null and
                     !mtp_active and
                     ctx.cache == &xfm.cache and
@@ -907,8 +955,14 @@ pub const Generator = struct {
                     }
                     _ = mlx.mlx_eval(eval_vec);
                 }
-                _ = mlx.mlx_clear_cache();
                 if (trace_enabled) eval_ns += prefill_sw.read() - eval_start_ns;
+                // Per-chunk buffer-cache nuke. Timed separately from eval so the
+                // trace shows its cost: MLX's allocator would otherwise reuse
+                // same-shaped chunk buffers for free, so on multi-chunk prefills
+                // this is pure overhead (see [risky] drop-per-chunk-clear work).
+                const clear_start_ns = if (trace_enabled) prefill_sw.read() else 0;
+                _ = mlx.mlx_clear_cache();
+                if (trace_enabled) clear_ns += prefill_sw.read() - clear_start_ns;
 
                 // Phase 1: snapshot SSM state at stride-aligned boundaries.
                 // We snapshot AFTER the eval above so the underlying buffers
@@ -1011,17 +1065,24 @@ pub const Generator = struct {
             const total_ns = prefill_sw.read();
             const ms = std.time.ns_per_ms;
             std.debug.print(
-                "  [prefill-trace] tokens={d} chunks={d} chunk_size={d} chunked={d}ms eval={d}ms last_token={d}ms total={d}ms{s}{s}\n",
+                "  [prefill-trace] tokens={d} chunks={d} chunk_size={d} ssm_stride={d} ssm_cps={d} warm_off={d} chunked={d}ms eval={d}ms clear={d}ms last_token={d}ms total={d}ms compiled={s}{s}{s}{s}{s}\n",
                 .{
                     prompt_ids.len,
                     n_chunks,
                     PREFILL_CHUNK,
+                    ssm_cp_stride,
+                    ssm_checkpoints.items.len,
+                    ssm_cp_offset,
                     chunked_ns / ms,
                     eval_ns / ms,
+                    clear_ns / ms,
                     last_ns / ms,
                     total_ns / ms,
-                    if (need_capture) " [capture-hidden]" else "",
+                    compiled_status,
+                    if (mtp_active) " [mtp]" else "",
+                    if (drafter_active) " [drafter]" else "",
                     if (pld_active) " [pld]" else "",
+                    if (need_capture) " [capture-hidden]" else "",
                 },
             );
         }
@@ -4965,6 +5026,21 @@ test "maskedMeanPoolNormalize excludes padded positions and unit-normalizes" {
     // Row 1: mean of (0,2),(0,4),(0,6) = (0,4) → normalized (0, 1).
     try testing.expectApproxEqAbs(@as(f32, 0.0), rows[1][0], 1e-4);
     try testing.expectApproxEqAbs(@as(f32, 1.0), rows[1][1], 1e-4);
+}
+
+test "compiledForwardStatus reports the first blocking gate condition in precedence order" {
+    const E = testing.expectEqualStrings;
+    // All gates pass → fast path is taken.
+    try E("USED", compiledForwardStatus(true, false, true, true, false, false));
+    // Precedence: no compiled closure wins over everything else.
+    try E("off (no compiled closure)", compiledForwardStatus(false, true, false, false, true, true));
+    // The default server-mode answer: per-slot cache breaks the alias even
+    // though a closure exists and nothing else blocks.
+    try E("skipped: per-slot-cache (ctx.cache != &xfm.cache)", compiledForwardStatus(true, false, false, true, false, false));
+    try E("skipped: mtp-active", compiledForwardStatus(true, true, true, true, false, false));
+    try E("skipped: ssm-entries-mismatch", compiledForwardStatus(true, false, true, false, false, false));
+    try E("skipped: capture-hidden", compiledForwardStatus(true, false, true, true, true, false));
+    try E("skipped: vision", compiledForwardStatus(true, false, true, true, false, true));
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
