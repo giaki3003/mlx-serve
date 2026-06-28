@@ -1346,6 +1346,10 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         0
     else if (prefill_tiled)
         kv_quant.tiledScoreTransientBytes(@intCast(heads), chunk, @as(u64, kv_quant.kv_attn_block), @intCast(prompt_len))
+    else if (!kv_quant.flashTilesAtHeadDim(hdim))
+        // Dense mode at a head_dim flash won't tile: it materializes the full
+        // score matrix. Bill that (huge) so we REJECT cleanly instead of OOMing.
+        kv_quant.denseScoresMaterializedBytes(@intCast(heads), chunk, @intCast(prompt_len))
     else
         kv_quant.denseDequantTransientBytes(full_attn_layers, @intCast(prompt_len), kv_heads, hdim);
     // Total estimate with 25% safety margin
@@ -1413,6 +1417,8 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
             " The prefill KV-dequant transient dominates — enable --kv-attn-mode fused (warm continuations then skip the dequant), lower --prefill-chunk to route prefill through the flat tiled path, raise --wired-limit, or shorten the prompt."
         else if (dense_dominates)
             " The cold-prefill KV-dequant transient dominates — lower --prefill-chunk (e.g. 512-1024) to route prefill through the flat tiled path, raise --wired-limit, or shorten the prompt."
+        else if (prefill_tiled)
+            " The tiled attention transient dominates (its tile is O(chunk × block)) — lower --prefill-chunk (e.g. 512) and/or --kv-attn-block, raise --wired-limit, or shorten the prompt. This head_dim doesn't flash-tile, so dense isn't an option."
         else
             " Reduce prompt size or use a smaller model.";
         const msg = try std.fmt.allocPrint(allocator,

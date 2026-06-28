@@ -554,6 +554,30 @@ pub fn denseDequantTransientBytes(full_attn_layers: u64, t_k: u64, h_kv: u64, hd
     return full_attn_layers * 2 * t_k * h_kv * hdim * 2;
 }
 
+/// Largest head_dim mlx's flash SDPA actually tiles. At/below this the dense
+/// path's scores never materialize (flash streams them), so dense is cheap. ABOVE
+/// it — observed at head_dim=256 — `mlx_fast_scaled_dot_product_attention`
+/// materializes the FULL `[B, H_q, T_q, t_k]` score matrix (~7.5 GB for a 4k
+/// chunk over 28k ctx → cold-prefill Metal OOM). Conservative cutoff (most flash
+/// kernels cap at 128); if mlx gains a wider kernel this only over-routes to the
+/// (correct, bounded) tiled path, never the reverse.
+pub const flash_sdpa_max_headdim: u64 = 128;
+
+pub fn flashTilesAtHeadDim(hdim: u64) bool {
+    return hdim <= flash_sdpa_max_headdim;
+}
+
+/// Peak bytes of the DENSE path's MATERIALIZED score matrix when flash does not
+/// tile (head_dim > flash_sdpa_max_headdim): `[B=1, H_q, T_q, t_k]` f32 with
+/// ~2 live copies (scores + softmax). Dwarfs the tiled `[.,T_q,block]` tile
+/// whenever t_k ≫ block, i.e. always at long context — so large-head_dim prefill
+/// must tile. Used by the admission so it REJECTS (clean 400) instead of letting
+/// dense OOM when neither path fits.
+const DENSE_SCORE_COPIES: u64 = 2;
+pub fn denseScoresMaterializedBytes(h_q: u64, t_q: u64, t_k: u64) u64 {
+    return DENSE_SCORE_COPIES * 4 * h_q * t_q * t_k;
+}
+
 /// Route a PREFILL attention chunk through the K-tiled fused path iff its
 /// bounded scores transient is both cheaper than the dense dequant it would
 /// replace AND under the absolute ceiling. The discriminator is T_q:
@@ -562,8 +586,12 @@ pub fn denseDequantTransientBytes(full_attn_layers: u64, t_k: u64, h_kv: u64, hd
 ///     re-dequantizing the whole context every turn and rejecting multi-turn.
 ///   * cold prefill (T_q == full chunk): `[H_q, chunk, block]` dwarfs the dense
 ///     dequant → DENSE (flash SDPA, which tiles both axes in-kernel).
-/// Decode (T_q==1) is gated separately at the call sites (always tiled) and does
-/// not consult this. Callers must also confirm fused mode + a quantized cache.
+/// EXCEPTION: when flash does NOT tile at this head_dim (>128, e.g. Ornith's
+/// 256), the dense path materializes the full score matrix instead of streaming
+/// it — so it is NEVER the safe choice and we ALWAYS tile (even past the budget
+/// ceiling; the admission then rejects cleanly if the tile itself won't fit,
+/// rather than letting dense OOM). Decode (T_q==1) is gated separately at the
+/// call sites (always tiled). Callers must also confirm fused mode + quant cache.
 pub fn preferTiledPrefill(
     h_q: u64,
     h_kv: u64,
@@ -573,6 +601,10 @@ pub fn preferTiledPrefill(
     full_attn_layers: u64,
     hdim: u64,
 ) bool {
+    // Dense flash can't tile here → it would materialize the whole score blob
+    // and OOM. Tiled is the only bounded path; take it regardless of budget
+    // (admission charges the real tiled cost and rejects if it won't fit).
+    if (!flashTilesAtHeadDim(hdim)) return true;
     const tiled = tiledScoreTransientBytes(h_q, t_q, block_k, t_k);
     if (kv_attn_tiled_budget_mb != 0 and
         tiled > @as(u64, kv_attn_tiled_budget_mb) * 1024 * 1024) return false;
