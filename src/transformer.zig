@@ -10334,3 +10334,79 @@ test "INTEGRATION KVCache: warm chunked prefill at PROD dims (head_dim=256, 16h/
     try testing.expect(max_dense < 0.05);
     try testing.expect(max_fused < 0.05);
 }
+
+// PRODUCTION BLOCK SIZE: the tiled tests above force a tiny kv_attn_block (8) to
+// walk many blocks over a small T_k. Production runs block=4096 with T_q=512
+// (--prefill-chunk 512) at head_dim=256 — decode (T_q=1, never masks) works but
+// cold prefill (T_q>1, masked, multi-block at block=4096) produced garbage. This
+// reproduces that exact shape: default block (4096), T_q=512, a context spanning
+// several 4096-blocks so the run is [visible blocks…] + one straddle (the masked
+// path) — all vs an independent full-sequence dense reference.
+test "INTEGRATION KVCache: tiled prefill at PROD block=4096, T_q=512, head_dim=256" {
+    const s = mlx.gpuStream();
+    const B: c_int = 1;
+    const H_q: c_int = 16;
+    const H_kv: c_int = 4;
+    const D: c_int = 256;
+    const resident: c_int = 8500;
+    const new_tok: c_int = 512;
+    const total: c_int = resident + new_tok; // 9012 → 3 blocks at block=4096
+
+    var cache = try KVCache.initWithKVConfigs(testing.allocator, 1, kv_quant.KVQuantConfig.affine(8), kv_quant.KVQuantConfig.turboquant(4), @intCast(D));
+    defer cache.deinit();
+
+    const k_full = try kv_quant.buildSmoothBHTD(s, B, H_kv, total, D);
+    defer _ = mlx.mlx_array_free(k_full);
+    const v_full = try kv_quant.buildSmoothBHTD(s, B, H_kv, total, D);
+    defer _ = mlx.mlx_array_free(v_full);
+    const q_new = try kv_quant.buildSmoothBHTD(s, B, H_q, new_tok, D);
+    defer _ = mlx.mlx_array_free(q_new);
+    const k0 = try kv_quant.sliceSeq(k_full, 0, resident, s);
+    defer _ = mlx.mlx_array_free(k0);
+    const v0 = try kv_quant.sliceSeq(v_full, 0, resident, s);
+    defer _ = mlx.mlx_array_free(v0);
+    const k1 = try kv_quant.sliceSeq(k_full, resident, total, s);
+    defer _ = mlx.mlx_array_free(k1);
+    const v1 = try kv_quant.sliceSeq(v_full, resident, total, s);
+    defer _ = mlx.mlx_array_free(v1);
+
+    {
+        var dv0 = try cache.update(0, k0, v0, s, 0);
+        dv0.deinit();
+    }
+    var view = try cache.update(0, k1, v1, s, 0);
+    defer view.deinit();
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    // NOTE: do NOT override kv_attn_block — use the production default (4096).
+    const none = mlx.mlx_array{ .ctx = null };
+
+    const fused = try kv_quant.quantAttention(q_new, view.kTriple(), view.vTriple(), view.k_bits, view.k_group_size, view.v_bits, view.v_group_size, view.k_rot, view.v_rot, scale, "causal", none, s);
+    defer _ = mlx.mlx_array_free(fused);
+
+    var qkf = try kv_quant.quantizeAffine(s, k_full, 64, 8);
+    defer qkf.deinit();
+    const k_ref = try kv_quant.dequantizeAffine(s, qkf.q, qkf.scales, qkf.biases, 64, 8);
+    defer _ = mlx.mlx_array_free(k_ref);
+    var qvf = try kv_quant.quantizeTurbo(s, v_full, view.v_rot, 64, 4);
+    defer qvf.deinit();
+    const v_ref = try kv_quant.dequantizeTurbo(s, qvf.q, qvf.scales, qvf.biases, view.v_rot, 64, 4);
+    defer _ = mlx.mlx_array_free(v_ref);
+    var ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref);
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ref, q_new, k_ref, v_ref, scale, "causal", none, .{ .ctx = null }, s));
+
+    const ref_flat = try kv_quant.readF32Flat(s, ref, testing.allocator);
+    defer testing.allocator.free(ref_flat);
+    const fused_flat = try kv_quant.readF32Flat(s, fused, testing.allocator);
+    defer testing.allocator.free(fused_flat);
+    try testing.expectEqual(ref_flat.len, fused_flat.len);
+    var max_err: f32 = 0;
+    var nan_count: usize = 0;
+    for (ref_flat, fused_flat) |r, f| {
+        if (std.math.isNan(f)) nan_count += 1;
+        max_err = @max(max_err, @abs(r - f));
+    }
+    try testing.expectEqual(@as(usize, 0), nan_count);
+    try testing.expect(max_err < 0.05);
+}
