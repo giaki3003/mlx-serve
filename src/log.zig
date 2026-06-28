@@ -1,12 +1,15 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Level = enum {
+    off,
     err,
     warn,
     info,
     debug,
 
     pub fn fromString(s: []const u8) ?Level {
+        if (std.mem.eql(u8, s, "off")) return .off;
         if (std.mem.eql(u8, s, "error")) return .err;
         if (std.mem.eql(u8, s, "warn")) return .warn;
         if (std.mem.eql(u8, s, "info")) return .info;
@@ -15,7 +18,13 @@ pub const Level = enum {
     }
 };
 
-var current_level: Level = .info;
+// Default to silent under `zig build test`: passing tests exercise
+// expected-path info/warn logs (tool-parse recovery, hot-cache eviction, image
+// token insertion, quant-mode rejection, …) that otherwise flood the runner.
+// Real test failures surface through the test runner (panics / error returns),
+// never through log.zig, so silencing here only removes noise — a failing test
+// still fails loudly. Non-test builds keep .info; both honor setLevel.
+var current_level: Level = if (builtin.is_test) .off else .info;
 
 pub fn setLevel(level: Level) void {
     current_level = level;
