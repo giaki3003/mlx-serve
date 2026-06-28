@@ -4312,12 +4312,13 @@ pub const Transformer = struct {
 
             // Fused-attn opt-in (DECODE ONLY): consume the cache's quant
             // triples directly via mlx_quantized_matmul, avoiding the dense-KV
-            // dequant spike at long-context decode. Gated to decode (T_q==1)
-            // because the hand-rolled qmm→softmax→qmm MATERIALIZES the full
-            // [T_q, T_k] score matrix, which flash SDPA (the dense path) never
-            // does — at prefill (T_q = chunk) that blows up across the
-            // async-eval'd layer graph and OOMs, while flash tiles it. Prefill
-            // and any precondition miss fall through to dense SDPA.
+            // dequant spike at long-context decode. quantAttention K-TILES this
+            // path (flash-2 online softmax), bounding the KEY axis — but the
+            // per-block scores tile is [B, H_q, T_q, block], and at prefill
+            // (T_q = chunk) the un-tiled QUERY axis makes that multi-GB per
+            // layer across the async-eval'd graph. Decode (T_q==1) is tiny and
+            // context-flat — the intended win. Prefill and any precondition
+            // miss fall through to dense flash SDPA, which tiles both axes.
             if (ctx.kv_attn_fused and kv_view.has_quant_triple and !is_prefill) {
                 const fused = try kv_quant.quantAttention(
                     q_rope,
@@ -6206,9 +6207,15 @@ pub const Transformer = struct {
         const none_mask = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(none_mask);
 
-        // Fused-attn opt-in (DECODE ONLY): see standard attention site for the
-        // rationale — fused qmm attention materializes the full score matrix,
-        // so prefill (T_q>1) uses flash SDPA below and only decode goes fused.
+        // Fused-attn opt-in (DECODE ONLY): consume the cache's quant triples
+        // directly via mlx_quantized_matmul. quantAttention K-TILES this path
+        // (flash-2 online softmax), so the per-block scores tile is
+        // [B, H_q, T_q, block] — at DECODE (T_q==1) that's tiny and flat in
+        // context, the win. At PREFILL (T_q==chunk) the UN-tiled query axis
+        // makes it [B, H_q, chunk, block] ≈ multi-GB per layer (K-tiling bounds
+        // the key axis, not the query axis), so prefill stays on flash SDPA,
+        // which tiles BOTH axes in-kernel over the (small, bounded) dequantized
+        // K/V. Flipping this to fused at prefill needs a Q-tile loop too.
         const sel_mode_moe: []const u8 = if (is_prefill) "causal" else "";
         if (ctx.kv_attn_fused and kv_view.has_quant_triple and !is_prefill) {
             const fused = try kv_quant.quantAttention(

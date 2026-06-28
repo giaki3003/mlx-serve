@@ -476,16 +476,23 @@ pub fn dequantizeAffine(
 // quantization throughout `transformer.zig`.
 //
 // Memory shape. For `causal` and `""` (the attention that grows with context)
-// this now runs a K-TILED online-softmax loop (`tiledCausalAttention`, the
-// manual flash-attention-2 interim for the "Fused quant-attention Metal kernel"
-// TODO): K/V are walked in `kv_attn_block` chunks, dequantized per block, with a
-// running (max, sum, output) in f32 — the full `[T_q, T_k]` scores and the full
-// dense K/V are NEVER materialized. Peak is O(block), CONTEXT-INDEPENDENT, which
-// retires the large-context OOM class for prefill AND decode (once validated
-// on-device, the decode-only call-site gate + the admission dequant term come
-// out). The `array` (explicit/sliding-window) path keeps the single-pass form:
-// the surviving context is bounded by the window, and tiling an arbitrary
-// additive mask means slicing it per block (no current consumer).
+// this runs a K-TILED online-softmax loop (`tiledCausalAttention`, the manual
+// flash-attention-2 interim for the "Fused quant-attention Metal kernel" TODO):
+// K/V are walked in `kv_attn_block` chunks, consumed per block via
+// quantized_matmul (the dense K/V is NEVER materialized) with a running
+// (max, sum, output) in f32 — the full `[T_q, T_k]` scores never form either.
+// This tiles the KEY axis only; the per-block scores tile is
+// `[B, H_q, T_q, block]`, so the peak is O(T_q · block):
+//   * DECODE (T_q==1): O(block) — flat in context. THE WIN; the call sites gate
+//     fused to decode for exactly this reason. A 120k decode tick never spikes.
+//   * PREFILL (T_q==chunk): O(chunk · block) — multi-GB per layer at chunk=8192,
+//     so prefill is NOT routed here; it uses flash SDPA over the (small,
+//     per-chunk-eval-bounded) dequantized K/V, which tiles BOTH axes in-kernel.
+//     Making fused prefill flat needs a Q-tile loop wrapping this one (each
+//     query block is independent — no online-softmax state crosses Q blocks).
+// The `array` (explicit/sliding-window) path keeps the single-pass form: the
+// surviving context is bounded by the window, and tiling an arbitrary additive
+// mask means slicing it per block (no current consumer).
 //
 // Shape contract:
 //   q_dense      : [B, H,    T_q, D] bf16 (Q already scaled or not; we apply scale below)
@@ -858,9 +865,10 @@ pub fn quantAttention(
         }
         try mlx.check(mlx.mlx_quantized_matmul(&out_folded, attn, v_triple.q, v_triple.scales, v_triple.biases, false, mlx.mlx_optional_int.some(@intCast(v_group_size)), mlx.mlx_optional_int.some(@intCast(v_bits)), "affine", s));
     } else {
-        // causal or "" (no mask): K-TILED online softmax — peak O(block),
-        // context-independent. Never materializes the full scores or dense KV;
-        // this is what retires the large-context attention OOM class.
+        // causal or "" (no mask): K-TILED online softmax. Never materializes
+        // the full scores or dense KV; peak is O(T_q · block) — O(block) and
+        // context-flat at DECODE (T_q==1, the gated use), O(chunk · block) at
+        // prefill (why the call sites keep prefill on flash SDPA — see header).
         const is_causal = std.mem.eql(u8, mask_mode, "causal");
         _ = mlx.mlx_array_free(out_folded);
         out_folded = try tiledCausalAttention(q_folded, k_triple, v_triple, k_bits, k_group_size, v_bits, v_group_size, scale, B, H_kv, repeats, T_q, t_k, D, is_causal, s);
