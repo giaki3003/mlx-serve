@@ -518,29 +518,72 @@ pub const HotPrefixCache = struct {
         self.logResident();
     }
 
+    /// P2 — minimum shared leading-token count for an entry to count as a reuse
+    /// "base" that eviction protects. Long shared prefixes (agent/Claude-Code
+    /// system prompts) are expensive to re-prefill, so unique branches are
+    /// dropped first; coincidental chat-template overlap is well under this.
+    const shared_protect_min: usize = 64;
+
+    /// True if `a` and `b` share at least `min` leading tokens. Early-exits at
+    /// `min`, so the cost is O(min) regardless of context length.
+    fn sharedPrefixAtLeast(a: []const u32, b: []const u32, min: usize) bool {
+        if (a.len < min or b.len < min) return false;
+        var i: usize = 0;
+        while (i < min) : (i += 1) {
+            if (a[i] != b[i]) return false;
+        }
+        return true;
+    }
+
     fn evictOneLru(self: *HotPrefixCache, reason: []const u8) void {
+        const items = self.entries.items;
+        // P2: bias eviction to RETAIN shared prefixes. An entry that shares a
+        // meaningful prefix (>= shared_protect_min tokens) with another live
+        // entry is a reuse base (e.g. a shared system prompt) whose re-prefill
+        // is expensive; evict "unique branch" entries (no such overlap) first,
+        // by LRU. Only when every entry is a shared base do we fall back to
+        // pure LRU over all of them — so a shared prefix survives even as older
+        // branches are dropped, but the cache still always makes progress.
         var lru_idx: usize = 0;
         var lru_used: u64 = std.math.maxInt(u64);
-        for (self.entries.items, 0..) |*e, i| {
+        var branch_idx: ?usize = null;
+        var branch_used: u64 = std.math.maxInt(u64);
+        for (items, 0..) |*e, i| {
             if (e.last_used < lru_used) {
                 lru_used = e.last_used;
                 lru_idx = i;
             }
+            var is_base = false;
+            for (items, 0..) |*o, j| {
+                if (j == i) continue;
+                if (sharedPrefixAtLeast(e.tokens, o.tokens, shared_protect_min)) {
+                    is_base = true;
+                    break;
+                }
+            }
+            if (!is_base and e.last_used < branch_used) {
+                branch_used = e.last_used;
+                branch_idx = i;
+            }
         }
-        var evicted = self.entries.swapRemove(lru_idx);
+        const protected_fallback = branch_idx == null;
+        const victim_idx = branch_idx orelse lru_idx;
+
+        var evicted = self.entries.swapRemove(victim_idx);
         const tokens_len = evicted.tokens.len;
         const kv_mb = @as(f64, @floatFromInt(evicted.kv_bytes)) / (1024.0 * 1024.0);
         const had_ssm = evicted.ssm_checkpoints != null;
         const ssm_mb = @as(f64, @floatFromInt(evicted.ssm_bytes)) / (1024.0 * 1024.0);
+        const tier: []const u8 = if (protected_fallback) "shared-base LRU" else "branch LRU";
         self.current_kv_bytes -|= evicted.kv_bytes;
         freeEntryOwnedState(self.allocator, &evicted);
         if (had_ssm) {
-            log.info("  [hot-cache] evicted LRU entry ({s}; was {d} tokens, {d:.2} MB; ssm {d:.2} MB)\n", .{
-                reason, tokens_len, kv_mb, ssm_mb,
+            log.info("  [hot-cache] evicted {s} entry ({s}; was {d} tokens, {d:.2} MB; ssm {d:.2} MB)\n", .{
+                tier, reason, tokens_len, kv_mb, ssm_mb,
             });
         } else {
-            log.info("  [hot-cache] evicted LRU entry ({s}; was {d} tokens, {d:.2} MB)\n", .{
-                reason, tokens_len, kv_mb,
+            log.info("  [hot-cache] evicted {s} entry ({s}; was {d} tokens, {d:.2} MB)\n", .{
+                tier, reason, tokens_len, kv_mb,
             });
         }
     }
@@ -706,4 +749,60 @@ test "HotPrefixCache: findBestMatch isolates affine 4-bit from affine 8-bit" {
     // never alias.
     const asym = kv_quant.KVQuantPair{ .k = kv_quant.KVQuantConfig.affine(8), .v = kv_quant.KVQuantConfig.turboquant(4) };
     try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, asym));
+}
+
+test "HotPrefixCache: eviction retains shared-prefix base, drops unique branch (P2)" {
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+
+    // Two entries sharing a 70-token prefix (> shared_protect_min=64) — reuse
+    // bases — plus one fully unique entry that is the MOST recently used.
+    const PFX: usize = 70;
+    const a = try testing.allocator.alloc(u32, PFX + 2);
+    for (a, 0..) |*t, i| t.* = @intCast(i);
+    a[PFX] = 1000;
+    a[PFX + 1] = 1001;
+    const b = try testing.allocator.alloc(u32, PFX + 2);
+    for (b, 0..) |*t, i| t.* = @intCast(i);
+    b[PFX] = 2000;
+    b[PFX + 1] = 2001;
+    const c = try testing.allocator.alloc(u32, PFX);
+    for (c, 0..) |*t, i| t.* = @intCast(9000 + i); // shares nothing with a/b
+
+    try cache.entries.append(testing.allocator, .{ .tokens = a, .has_tools = false, .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .k_config = transformer_mod.KVQuantConfig.dense, .v_config = transformer_mod.KVQuantConfig.dense }, .last_used = 1, .quant_config = kv_quant.KVQuantPair.dense, .kv_bytes = 0, .ssm_checkpoints = null, .ssm_bytes = 0 });
+    try cache.entries.append(testing.allocator, .{ .tokens = b, .has_tools = false, .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .k_config = transformer_mod.KVQuantConfig.dense, .v_config = transformer_mod.KVQuantConfig.dense }, .last_used = 2, .quant_config = kv_quant.KVQuantPair.dense, .kv_bytes = 0, .ssm_checkpoints = null, .ssm_bytes = 0 });
+    try cache.entries.append(testing.allocator, .{ .tokens = c, .has_tools = false, .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .k_config = transformer_mod.KVQuantConfig.dense, .v_config = transformer_mod.KVQuantConfig.dense }, .last_used = 3, .quant_config = kv_quant.KVQuantPair.dense, .kv_bytes = 0, .ssm_checkpoints = null, .ssm_bytes = 0 });
+
+    // Pure LRU would evict `a` (last_used=1, oldest). The P2 bias must instead
+    // evict the unique branch `c` (newest, but shares no long prefix), keeping
+    // both shared bases resident.
+    cache.evictOneLru("test");
+
+    try testing.expectEqual(@as(usize, 2), cache.entries.items.len);
+    for (cache.entries.items) |*e| {
+        try testing.expect(e.tokens[0] != 9000); // `c` (its first token) is gone
+    }
+}
+
+test "HotPrefixCache: eviction falls back to pure LRU when all are shared bases (P2)" {
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+
+    // Both entries share a 70-token prefix → both protected → no unique branch.
+    // Eviction must still make progress, dropping the LRU (a, last_used=1).
+    const PFX: usize = 70;
+    const a = try testing.allocator.alloc(u32, PFX + 1);
+    for (a, 0..) |*t, i| t.* = @intCast(i);
+    a[PFX] = 1000;
+    const b = try testing.allocator.alloc(u32, PFX + 1);
+    for (b, 0..) |*t, i| t.* = @intCast(i);
+    b[PFX] = 2000;
+
+    try cache.entries.append(testing.allocator, .{ .tokens = a, .has_tools = false, .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .k_config = transformer_mod.KVQuantConfig.dense, .v_config = transformer_mod.KVQuantConfig.dense }, .last_used = 1, .quant_config = kv_quant.KVQuantPair.dense, .kv_bytes = 0, .ssm_checkpoints = null, .ssm_bytes = 0 });
+    try cache.entries.append(testing.allocator, .{ .tokens = b, .has_tools = false, .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .k_config = transformer_mod.KVQuantConfig.dense, .v_config = transformer_mod.KVQuantConfig.dense }, .last_used = 2, .quant_config = kv_quant.KVQuantPair.dense, .kv_bytes = 0, .ssm_checkpoints = null, .ssm_bytes = 0 });
+
+    cache.evictOneLru("test");
+
+    try testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    try testing.expectEqual(@as(u32, 2000), cache.entries.items[0].tokens[PFX]); // b (last_used=2) survives
 }
