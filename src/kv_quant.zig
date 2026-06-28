@@ -582,7 +582,7 @@ pub fn preferTiledPrefill(
 /// Slice a `[B, H, T, X]` array to `[B, H, t0:t1, X]` along the sequence axis.
 /// Caller owns the result. (The K/V quant triples are already strided cache
 /// views; `mlx_quantized_matmul` consumes a further slice fine.)
-fn sliceSeq(a: mlx.mlx_array, t0: c_int, t1: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+pub fn sliceSeq(a: mlx.mlx_array, t0: c_int, t1: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     const sh = mlx.getShape(a);
     if (sh.len < 4) return error.UnexpectedShape;
     const start = [_]c_int{ 0, 0, t0, 0 };
@@ -982,7 +982,7 @@ fn buildSmoothBf16(s: mlx.mlx_stream, head_dim: c_int) !mlx.mlx_array {
 
 /// Read a flat float32 host buffer for a small array (eval-and-copy via
 /// `mlx_astype` to float32 then reshape to 1D).
-fn readF32Flat(s: mlx.mlx_stream, arr: mlx.mlx_array, allocator: std.mem.Allocator) ![]f32 {
+pub fn readF32Flat(s: mlx.mlx_stream, arr: mlx.mlx_array, allocator: std.mem.Allocator) ![]f32 {
     var f32_view = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(f32_view);
     try mlx.check(mlx.mlx_astype(&f32_view, arr, .float32, s));
@@ -1204,7 +1204,7 @@ test "TurboState.initHadamard rejects non-power-of-2 head_dim" {
 
 /// Build a `[B, H, T, D]` dense bf16 with smooth ramped values per
 /// `(b, h, t, d)` so quantization is non-trivial. Caller frees.
-fn buildSmoothBHTD(s: mlx.mlx_stream, B: c_int, H: c_int, T: c_int, D: c_int) !mlx.mlx_array {
+pub fn buildSmoothBHTD(s: mlx.mlx_stream, B: c_int, H: c_int, T: c_int, D: c_int) !mlx.mlx_array {
     const total: usize = @intCast(B * H * T * D);
     const buf = try testing.allocator.alloc(f32, total);
     defer testing.allocator.free(buf);
@@ -2150,4 +2150,151 @@ test "preferTiledPrefill routes warm small-T_q to tiled, cold full-chunk to dens
     kv_attn_tiled_budget_mb = 0;
     try testing.expect(!preferTiledPrefill(h_q, h_kv, 8192, block, t_k, fa, hdim));
     try testing.expect(preferTiledPrefill(h_q, h_kv, 251, block, t_k, fa, hdim));
+}
+
+// ── TURBO × tiled × T_q>1 (the prod-config coverage gap) ──
+//
+// The multi-block tiled tests above are affine-only; the multi-block turbo test
+// is decode (T_q=1, never masks). The turbo causal tests are T_q>1 but single
+// block. So turbo + T_q>1 + MULTI-BLOCK (mask interacting with the per-block
+// Q-rotation/V-rotation accumulation) was untested — exactly what warm prefill
+// hits with the user's K affine-8 / V turbo-4 config. These force a tiny block
+// and a warm shape (T_q ≪ T_k, q0>0) and compare to dense SDPA over the matching
+// per-side dequantization.
+
+test "tiled TURBO: K affine8 + V turbo4, T_q>1 multi-block causal matches dense SDPA" {
+    const s = mlx.gpuStream();
+    const saved = kv_attn_block;
+    kv_attn_block = 8; // [0,8)[8,16)[16,24)[24,30): partial tail; straddle at end
+    defer kv_attn_block = saved;
+
+    const B: c_int = 1;
+    const H_q: c_int = 4;
+    const H_kv: c_int = 2;
+    const T_q: c_int = 3;
+    const T_k: c_int = 30; // q0 = 27
+    const D: c_int = 64;
+    const q = try buildSmoothBHTD(s, B, H_q, T_q, D);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = try buildSmoothBHTD(s, B, H_kv, T_k, D);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = try buildSmoothBHTD(s, B, H_kv, T_k, D);
+    defer _ = mlx.mlx_array_free(v_dense);
+
+    var ts = try TurboState.initHadamard(testing.allocator, s, 1, @intCast(D));
+    defer ts.deinit();
+    const rv = ts.rv[0];
+
+    var qk = try quantizeAffine(s, k_dense, 64, 8);
+    defer qk.deinit();
+    var qv = try quantizeTurbo(s, v_dense, rv, 64, 4);
+    defer qv.deinit();
+    const k_ref = try dequantizeAffine(s, qk.q, qk.scales, qk.biases, 64, 8);
+    defer _ = mlx.mlx_array_free(k_ref);
+    const v_ref = try dequantizeTurbo(s, qv.q, qv.scales, qv.biases, rv, 64, 4);
+    defer _ = mlx.mlx_array_free(v_ref);
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    var ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref);
+    const none_mask = mlx.mlx_array{ .ctx = null };
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ref, q, k_ref, v_ref, scale, "causal", none_mask, .{ .ctx = null }, s));
+
+    const cand = try quantAttention(
+        q,
+        .{ .q = qk.q, .scales = qk.scales, .biases = qk.biases },
+        .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
+        8,
+        64,
+        4,
+        64,
+        .{ .ctx = null }, // K affine: no rotation
+        rv, // V turbo: rotation
+        scale,
+        "causal",
+        none_mask,
+        s,
+    );
+    defer _ = mlx.mlx_array_free(cand);
+
+    const ref_flat = try readF32Flat(s, ref, testing.allocator);
+    defer testing.allocator.free(ref_flat);
+    const cand_flat = try readF32Flat(s, cand, testing.allocator);
+    defer testing.allocator.free(cand_flat);
+    try testing.expectEqual(ref_flat.len, cand_flat.len);
+    var max_err: f32 = 0;
+    for (ref_flat, cand_flat) |r, c| {
+        const e = @abs(r - c);
+        if (e > max_err) max_err = e;
+    }
+    try testing.expect(max_err < 0.05);
+}
+
+test "tiled TURBO: K turbo4 + V turbo4 (Rk != Rv), T_q>1 multi-block causal matches dense SDPA" {
+    const s = mlx.gpuStream();
+    const saved = kv_attn_block;
+    kv_attn_block = 8;
+    defer kv_attn_block = saved;
+
+    const B: c_int = 1;
+    const H_q: c_int = 4;
+    const H_kv: c_int = 2;
+    const T_q: c_int = 3;
+    const T_k: c_int = 30;
+    const D: c_int = 64;
+    const q = try buildSmoothBHTD(s, B, H_q, T_q, D);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = try buildSmoothBHTD(s, B, H_kv, T_k, D);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = try buildSmoothBHTD(s, B, H_kv, T_k, D);
+    defer _ = mlx.mlx_array_free(v_dense);
+
+    var ts = try TurboState.initHadamard(testing.allocator, s, 1, @intCast(D));
+    defer ts.deinit();
+    const rk = ts.rk[0];
+    const rv = ts.rv[0];
+
+    var qk = try quantizeTurbo(s, k_dense, rk, 64, 4);
+    defer qk.deinit();
+    var qv = try quantizeTurbo(s, v_dense, rv, 64, 4);
+    defer qv.deinit();
+    const k_ref = try dequantizeTurbo(s, qk.q, qk.scales, qk.biases, rk, 64, 4);
+    defer _ = mlx.mlx_array_free(k_ref);
+    const v_ref = try dequantizeTurbo(s, qv.q, qv.scales, qv.biases, rv, 64, 4);
+    defer _ = mlx.mlx_array_free(v_ref);
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    var ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref);
+    const none_mask = mlx.mlx_array{ .ctx = null };
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ref, q, k_ref, v_ref, scale, "causal", none_mask, .{ .ctx = null }, s));
+
+    const cand = try quantAttention(
+        q,
+        .{ .q = qk.q, .scales = qk.scales, .biases = qk.biases },
+        .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
+        4,
+        64,
+        4,
+        64,
+        rk,
+        rv,
+        scale,
+        "causal",
+        none_mask,
+        s,
+    );
+    defer _ = mlx.mlx_array_free(cand);
+
+    const ref_flat = try readF32Flat(s, ref, testing.allocator);
+    defer testing.allocator.free(ref_flat);
+    const cand_flat = try readF32Flat(s, cand, testing.allocator);
+    defer testing.allocator.free(cand_flat);
+    try testing.expectEqual(ref_flat.len, cand_flat.len);
+    var max_err: f32 = 0;
+    for (ref_flat, cand_flat) |r, c| {
+        const e = @abs(r - c);
+        if (e > max_err) max_err = e;
+    }
+    try testing.expect(max_err < 0.05);
 }

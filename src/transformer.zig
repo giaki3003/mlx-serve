@@ -10066,3 +10066,190 @@ fn gdnTestRunSeqAt(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.
     try mlx.check(mlx.mlx_reshape(&out, sliced, &fshape, 4, s));
     return out;
 }
+
+// ── INTEGRATION: warm chunked-prefill attention through the REAL KVCache ──
+//
+// The kv_quant parity tests feed quantAttention freshly-built contiguous arrays
+// — they never exercise the production call path: a real KVCache filled by
+// chunked update()s (so t_k/q0 come from the cache length, K/V are strided cache
+// views, and turbo rotations come from the cache's deterministic TurboState).
+// Before the tile-size gate, warm prefill was admission-REJECTED, so it never
+// ran; now it runs fused, and "parity passes / production garbage" points
+// exactly here. These drive update() to build a q0>0 continuation and compare
+// BOTH the cache's fused path AND its dense path against an INDEPENDENT
+// full-sequence reference (quantize→dequantize the whole [0,total) sequence,
+// one causal SDPA). Comparing fused-vs-dense alone would pass even if both were
+// positionally wrong; the independent ref is what catches an offset/assembly
+// bug. A positional error blows far past the ~0.05 quantization error.
+
+test "INTEGRATION KVCache: warm chunked prefill (q0>0) fused+dense match full-seq ref (K affine8/V turbo4)" {
+    const s = mlx.gpuStream();
+    const B: c_int = 1;
+    const H_q: c_int = 4;
+    const H_kv: c_int = 2;
+    const D: c_int = 64;
+    const resident: c_int = 20;
+    const new_tok: c_int = 3;
+    const total: c_int = resident + new_tok; // 23 → q0 = 20
+
+    var cache = try KVCache.initWithKVConfigs(testing.allocator, 1, kv_quant.KVQuantConfig.affine(8), kv_quant.KVQuantConfig.turboquant(4), @intCast(D));
+    defer cache.deinit();
+
+    // Full-sequence K/V; the cache is fed its [0,resident) and [resident,total)
+    // slices so the independent ref uses identical values.
+    const k_full = try kv_quant.buildSmoothBHTD(s, B, H_kv, total, D);
+    defer _ = mlx.mlx_array_free(k_full);
+    const v_full = try kv_quant.buildSmoothBHTD(s, B, H_kv, total, D);
+    defer _ = mlx.mlx_array_free(v_full);
+    const q_new = try kv_quant.buildSmoothBHTD(s, B, H_q, new_tok, D);
+    defer _ = mlx.mlx_array_free(q_new);
+
+    const k0 = try kv_quant.sliceSeq(k_full, 0, resident, s);
+    defer _ = mlx.mlx_array_free(k0);
+    const v0 = try kv_quant.sliceSeq(v_full, 0, resident, s);
+    defer _ = mlx.mlx_array_free(v0);
+    const k1 = try kv_quant.sliceSeq(k_full, resident, total, s);
+    defer _ = mlx.mlx_array_free(k1);
+    const v1 = try kv_quant.sliceSeq(v_full, resident, total, s);
+    defer _ = mlx.mlx_array_free(v1);
+
+    { // resident prefill chunk
+        var dv0 = try cache.update(0, k0, v0, s, 0);
+        dv0.deinit();
+    }
+    var view = try cache.update(0, k1, v1, s, 0); // warm continuation, q0=20
+    defer view.deinit();
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    const saved = kv_quant.kv_attn_block;
+    kv_quant.kv_attn_block = 8; // force multi-block tiling over the 23-len ctx
+    defer kv_quant.kv_attn_block = saved;
+    const none = mlx.mlx_array{ .ctx = null };
+
+    // (1) cache FUSED — real triples + real rotations.
+    const fused = try kv_quant.quantAttention(q_new, view.kTriple(), view.vTriple(), view.k_bits, view.k_group_size, view.v_bits, view.v_group_size, view.k_rot, view.v_rot, scale, "causal", none, s);
+    defer _ = mlx.mlx_array_free(fused);
+
+    // (2) cache DENSE — the cache's own dequantized full K/V (path fused replaces).
+    var cache_dense = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cache_dense);
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&cache_dense, q_new, view.k, view.v, scale, "causal", none, .{ .ctx = null }, s));
+
+    // (3) independent REF — quantize+dequantize the WHOLE sequence, one causal
+    //     SDPA. V uses the cache's deterministic layer-0 rotation (== view.v_rot).
+    var qkf = try kv_quant.quantizeAffine(s, k_full, 64, 8);
+    defer qkf.deinit();
+    const k_ref = try kv_quant.dequantizeAffine(s, qkf.q, qkf.scales, qkf.biases, 64, 8);
+    defer _ = mlx.mlx_array_free(k_ref);
+    var qvf = try kv_quant.quantizeTurbo(s, v_full, view.v_rot, 64, 4);
+    defer qvf.deinit();
+    const v_ref = try kv_quant.dequantizeTurbo(s, qvf.q, qvf.scales, qvf.biases, view.v_rot, 64, 4);
+    defer _ = mlx.mlx_array_free(v_ref);
+    var ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref);
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ref, q_new, k_ref, v_ref, scale, "causal", none, .{ .ctx = null }, s));
+
+    const ref_flat = try kv_quant.readF32Flat(s, ref, testing.allocator);
+    defer testing.allocator.free(ref_flat);
+    const fused_flat = try kv_quant.readF32Flat(s, fused, testing.allocator);
+    defer testing.allocator.free(fused_flat);
+    const dense_flat = try kv_quant.readF32Flat(s, cache_dense, testing.allocator);
+    defer testing.allocator.free(dense_flat);
+    try testing.expectEqual(ref_flat.len, fused_flat.len);
+    try testing.expectEqual(ref_flat.len, dense_flat.len);
+    var max_fused: f32 = 0;
+    var max_dense: f32 = 0;
+    for (ref_flat, fused_flat, dense_flat) |r, f, d| {
+        max_fused = @max(max_fused, @abs(r - f));
+        max_dense = @max(max_dense, @abs(r - d));
+    }
+    // dense-vs-ref tests the cache's assembly/offset; fused-vs-ref tests the
+    // tiled path in the real cache context. A positional bug ≫ 0.05.
+    try testing.expect(max_dense < 0.05);
+    try testing.expect(max_fused < 0.05);
+}
+
+test "INTEGRATION KVCache: warm prefill AFTER snapshot/restore matches full-seq ref (K affine8/V turbo4)" {
+    const s = mlx.gpuStream();
+    const B: c_int = 1;
+    const H_q: c_int = 4;
+    const H_kv: c_int = 2;
+    const D: c_int = 64;
+    const resident: c_int = 20;
+    const new_tok: c_int = 3;
+    const total: c_int = resident + new_tok;
+
+    const k_full = try kv_quant.buildSmoothBHTD(s, B, H_kv, total, D);
+    defer _ = mlx.mlx_array_free(k_full);
+    const v_full = try kv_quant.buildSmoothBHTD(s, B, H_kv, total, D);
+    defer _ = mlx.mlx_array_free(v_full);
+    const q_new = try kv_quant.buildSmoothBHTD(s, B, H_q, new_tok, D);
+    defer _ = mlx.mlx_array_free(q_new);
+    const k0 = try kv_quant.sliceSeq(k_full, 0, resident, s);
+    defer _ = mlx.mlx_array_free(k0);
+    const v0 = try kv_quant.sliceSeq(v_full, 0, resident, s);
+    defer _ = mlx.mlx_array_free(v0);
+    const k1 = try kv_quant.sliceSeq(k_full, resident, total, s);
+    defer _ = mlx.mlx_array_free(k1);
+    const v1 = try kv_quant.sliceSeq(v_full, resident, total, s);
+    defer _ = mlx.mlx_array_free(v1);
+
+    // Original request: prefill the resident chunk, snapshot (what the hot
+    // prefix cache stores), then tear that request's live cache down.
+    var snap = blk: {
+        var cache1 = try KVCache.initWithKVConfigs(testing.allocator, 1, kv_quant.KVQuantConfig.affine(8), kv_quant.KVQuantConfig.turboquant(4), @intCast(D));
+        defer cache1.deinit();
+        var dv0 = try cache1.update(0, k0, v0, s, 0);
+        dv0.deinit();
+        break :blk try cache1.snapshot();
+    };
+    defer snap.deinit();
+
+    // New request: restore the resident KV into a FRESH cache, then prefill the
+    // warm continuation — the exact warm multi-turn path.
+    var cache2 = try KVCache.initWithKVConfigs(testing.allocator, 1, kv_quant.KVQuantConfig.affine(8), kv_quant.KVQuantConfig.turboquant(4), @intCast(D));
+    defer cache2.deinit();
+    try cache2.restore(&snap);
+    var view = try cache2.update(0, k1, v1, s, 0);
+    defer view.deinit();
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    const saved = kv_quant.kv_attn_block;
+    kv_quant.kv_attn_block = 8;
+    defer kv_quant.kv_attn_block = saved;
+    const none = mlx.mlx_array{ .ctx = null };
+
+    const fused = try kv_quant.quantAttention(q_new, view.kTriple(), view.vTriple(), view.k_bits, view.k_group_size, view.v_bits, view.v_group_size, view.k_rot, view.v_rot, scale, "causal", none, s);
+    defer _ = mlx.mlx_array_free(fused);
+    var cache_dense = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cache_dense);
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&cache_dense, q_new, view.k, view.v, scale, "causal", none, .{ .ctx = null }, s));
+
+    var qkf = try kv_quant.quantizeAffine(s, k_full, 64, 8);
+    defer qkf.deinit();
+    const k_ref = try kv_quant.dequantizeAffine(s, qkf.q, qkf.scales, qkf.biases, 64, 8);
+    defer _ = mlx.mlx_array_free(k_ref);
+    var qvf = try kv_quant.quantizeTurbo(s, v_full, view.v_rot, 64, 4);
+    defer qvf.deinit();
+    const v_ref = try kv_quant.dequantizeTurbo(s, qvf.q, qvf.scales, qvf.biases, view.v_rot, 64, 4);
+    defer _ = mlx.mlx_array_free(v_ref);
+    var ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref);
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ref, q_new, k_ref, v_ref, scale, "causal", none, .{ .ctx = null }, s));
+
+    const ref_flat = try kv_quant.readF32Flat(s, ref, testing.allocator);
+    defer testing.allocator.free(ref_flat);
+    const fused_flat = try kv_quant.readF32Flat(s, fused, testing.allocator);
+    defer testing.allocator.free(fused_flat);
+    const dense_flat = try kv_quant.readF32Flat(s, cache_dense, testing.allocator);
+    defer testing.allocator.free(dense_flat);
+    try testing.expectEqual(ref_flat.len, fused_flat.len);
+    var max_fused: f32 = 0;
+    var max_dense: f32 = 0;
+    for (ref_flat, fused_flat, dense_flat) |r, f, d| {
+        max_fused = @max(max_fused, @abs(r - f));
+        max_dense = @max(max_dense, @abs(r - d));
+    }
+    try testing.expect(max_dense < 0.05);
+    try testing.expect(max_fused < 0.05);
+}
