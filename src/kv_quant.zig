@@ -520,6 +520,12 @@ pub const BorrowedTriple = struct {
 /// not pair a large value with a large `--prefill-chunk`.
 pub var kv_attn_block: u32 = 4096;
 
+/// Process-wide opt-in for the GRAIL fused-quant flash-attention kernel
+/// (`--kv-attn-grail`). When true, eligible fused-attn call sites route to
+/// `grailAttention` (one fused Metal kernel, no per-block op-launch overhead)
+/// instead of `quantAttention`. Default false → unchanged behavior.
+pub var kv_attn_grail: bool = false;
+
 /// Absolute ceiling (MB) on the tiled-attention scores transient before a
 /// prefill chunk is refused the tiled path regardless of the tiled-vs-dense
 /// comparison (0 = no ceiling). Safety override for `--kv-attn-tiled-budget`.

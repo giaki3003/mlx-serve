@@ -525,6 +525,11 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             kv_quant_mod.kv_attn_tiled_budget_mb = n;
+        } else if (std.mem.eql(u8, args[i], "--kv-attn-grail")) {
+            // Opt-in: route fused-quant attention through the GRAIL fused Metal
+            // kernel (one kernel, no per-block op-launch overhead) instead of the
+            // graph-level quantAttention. Bare flag (no value).
+            kv_quant_mod.kv_attn_grail = true;
         } else if (std.mem.eql(u8, args[i], "--idle-evict-secs") and i + 1 < args.len) {
             // Plan 05 Phase D: idle-tick eviction window. When set, the
             // inference loop's idle path evicts .ready entries (refcount==0)

@@ -4333,7 +4333,31 @@ pub const Transformer = struct {
                     cfg.fullAttentionLayers(),
                     @intCast(hd),
                 );
-            if (ctx.kv_attn_fused and kv_view.has_quant_triple and route_tiled_std) {
+            // Grail (--kv-attn-grail): the fused-quant flash kernel is memory-safe
+            // at ANY length (no score matrix / dense KV), so it routes causal/""
+            // at all T_q (incl. cold prefill); array-mask stays decode-only here
+            // (grailAttention defers array to quantAttention, which materializes
+            // at prefill — keep sliding-window prefill on dense flash SDPA).
+            const route_grail_std = if (std.mem.eql(u8, sel_mode, "array")) !is_prefill else true;
+            if (kv_quant.kv_attn_grail and ctx.kv_attn_fused and kv_view.has_quant_triple and route_grail_std) {
+                const g = try kv_quant.grailAttention(
+                    q_rope,
+                    kv_view.kTriple(),
+                    kv_view.vTriple(),
+                    kv_view.k_bits,
+                    kv_view.k_group_size,
+                    kv_view.v_bits,
+                    kv_view.v_group_size,
+                    kv_view.k_rot,
+                    kv_view.v_rot,
+                    attn_scale,
+                    sel_mode,
+                    sel_mask,
+                    self.s,
+                );
+                _ = mlx.mlx_array_free(attn_out);
+                attn_out = g;
+            } else if (ctx.kv_attn_fused and kv_view.has_quant_triple and route_tiled_std) {
                 const fused = try kv_quant.quantAttention(
                     q_rope,
                     kv_view.kTriple(),
@@ -6244,7 +6268,28 @@ pub const Transformer = struct {
             self.config.fullAttentionLayers(),
             @intCast(hd),
         );
-        if (ctx.kv_attn_fused and kv_view.has_quant_triple and route_tiled_moe) {
+        // Grail (--kv-attn-grail): the fused-quant flash kernel is memory-safe at
+        // any length, so route ALL fused-eligible attention (decode + warm + cold
+        // prefill) through it — no route_tiled gate. No array mask on this path.
+        if (kv_quant.kv_attn_grail and ctx.kv_attn_fused and kv_view.has_quant_triple) {
+            const g = try kv_quant.grailAttention(
+                q_rope,
+                kv_view.kTriple(),
+                kv_view.vTriple(),
+                kv_view.k_bits,
+                kv_view.k_group_size,
+                kv_view.v_bits,
+                kv_view.v_group_size,
+                kv_view.k_rot,
+                kv_view.v_rot,
+                attn_scale,
+                sel_mode_moe,
+                none_mask,
+                self.s,
+            );
+            _ = mlx.mlx_array_free(attn_out);
+            attn_out = g;
+        } else if (ctx.kv_attn_fused and kv_view.has_quant_triple and route_tiled_moe) {
             const fused = try kv_quant.quantAttention(
                 q_rope,
                 kv_view.kTriple(),
