@@ -1,3 +1,10 @@
 [submodule "lib/ds4"]
 	path = lib/ds4
 	url = https://github.com/antirez/ds4
+[submodule "lib/mlx"]
+	path = lib/mlx
+	url = https://github.com/giaki3003/mlx.git
+	branch = feat/flash256-quant-grail
+[submodule "lib/mlx-c"]
+	path = lib/mlx-c
+	url = https://github.com/giaki3003/mlx-c.git

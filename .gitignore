@@ -38,3 +38,7 @@ docs/tmp
 tests/pi-results
 tests/validator-results
 tests/pi_integration_run.summary.tsv
+
+# vendored MLX build (scripts/ornith/build-mlx.sh)
+/lib/mlx-dist/
+/.mlx-build/

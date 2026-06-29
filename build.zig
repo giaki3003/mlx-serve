@@ -89,10 +89,12 @@ pub fn build(b: *std.Build) void {
     // dylib + headers extracted from the pinned XCFramework). See src/arch/llama.zig.
     addLlamaLib(b, mod);
 
-    // mlx-c include/lib paths (homebrew)
+    // mlx + mlx-c from vendored submodules, staged into lib/mlx-dist by
+    // scripts/ornith/build-mlx.sh (mirrors addLlamaLib / lib/llama).
+    addMlxLib(b, mod);
+    // webp is still a Homebrew dep
     mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    mod.linkSystemLibrary("mlxc", .{});
     mod.linkSystemLibrary("webp", .{});
 
     if (macos_sdk_frameworks) |fw_path| {
@@ -142,9 +144,9 @@ pub fn build(b: *std.Build) void {
     test_mod.addIncludePath(b.path("lib/ds4"));
     addLlamaLib(b, test_mod);
     test_mod.linkSystemLibrary("c++", .{});
+    addMlxLib(b, test_mod);
     test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    test_mod.linkSystemLibrary("mlxc", .{});
     test_mod.linkSystemLibrary("webp", .{});
 
     if (macos_sdk_frameworks) |fw_path| {
@@ -229,11 +231,21 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
     });
 }
 
+fn addMlxLib(b: *std.Build, module: *std.Build.Module) void {
+    // libmlx + libmlxc from the lib/mlx and lib/mlx-c submodules, built by
+    // scripts/ornith/build-mlx.sh into lib/mlx-dist/{include,lib}. One include
+    // dir carries both mlx/*.h and mlx/c/*.h. use_pkg_config=.no so a stray
+    // Homebrew mlx-c cannot hijack the link; rpath covers shared libs
+    // (harmless for static).
+    module.addIncludePath(b.path("lib/mlx-dist/include"));
+    module.addLibraryPath(b.path("lib/mlx-dist/lib"));
+    module.linkSystemLibrary("mlxc", .{ .use_pkg_config = .no });
+    module.addRPath(b.path("lib/mlx-dist/lib"));
+}
+
 const BrewDep = struct { name: []const u8, min: std.SemanticVersion };
 
 const required_brew_deps = [_]BrewDep{
-    .{ .name = "mlx", .min = .{ .major = 0, .minor = 31, .patch = 2 } },
-    .{ .name = "mlx-c", .min = .{ .major = 0, .minor = 6, .patch = 0 } },
     .{ .name = "webp", .min = .{ .major = 1, .minor = 6, .patch = 0 } },
 };
 
