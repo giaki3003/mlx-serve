@@ -1039,9 +1039,9 @@ const GRAIL_KERNEL_SOURCE =
     \\    for (int df = 0; df < NDF; ++df) Oreg[df] *= invl;
     \\  }
     \\  for (int df = 0; df < NDF; ++df) {
-    \\    simdgroup_matrix<float, 8, 8> Otmp;
-    \\    reinterpret_cast<thread float2&>(Otmp.thread_elements()) = Oreg[df];
-    \\    simdgroup_store(Otmp, Qs, D, ulong2(df * 8, sg_row), false);
+    \\    simdgroup_matrix<half, 8, 8> Oh;                         // half matrix -> half Qs (type must match)
+    \\    reinterpret_cast<thread half2&>(Oh.thread_elements()) = (half2)Oreg[df];
+    \\    simdgroup_store(Oh, Qs, D, ulong2(df * 8, sg_row), false);
     \\  }
     \\  threadgroup_barrier(mem_flags::mem_threadgroup);
     \\  auto out_ = out + (b * Hq + h_q) * Tq * D;
