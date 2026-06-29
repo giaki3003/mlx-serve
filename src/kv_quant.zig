@@ -935,8 +935,8 @@ const GRAIL_KERNEL_SOURCE =
     \\  // 'fm' = this lane's fragment ROW in the Apple simdgroup_matrix 8x8 layout
     \\  // (a lane owns 2 elements in one row), used for the per-row O rescale.
     \\  int fm = (int)(((lane >> 1) & 1u) + 2u * ((lane >> 2) & 1u) + 4u * ((lane >> 4) & 1u));
-    \\  simdgroup_matrix<float, 8, 8> Oreg[NDF];
-    \\  for (int df = 0; df < NDF; ++df) Oreg[df] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    \\  float2 Oreg[NDF];                                 // O accumulator: per-lane frag storage
+    \\  for (int df = 0; df < NDF; ++df) Oreg[df] = float2(0.0f, 0.0f);
     \\
     \\  int qmax_abs = q0 + q_base + (BQ - 1);            // upper bound on query pos in tile
     \\
@@ -1000,9 +1000,7 @@ const GRAIL_KERNEL_SOURCE =
     \\    // Rescale running O (registers) by this lane's per-row correction.
     \\    {
     \\      float cr = corr[fm];
-    \\      for (int df = 0; df < NDF; ++df) {
-    \\        float2 el = Oreg[df].thread_elements(); el *= cr; Oreg[df].thread_elements() = el;
-    \\      }
+    \\      for (int df = 0; df < NDF; ++df) Oreg[df] *= cr;
     \\    }
     \\
     \\    // Dequant V block -> KVs [BK, D].
@@ -1023,14 +1021,21 @@ const GRAIL_KERNEL_SOURCE =
     \\    for (int df = 0; df < NDF; ++df) {
     \\      simdgroup_matrix<float, 8, 8> Vf;
     \\      simdgroup_load(Vf, KVs, D, ulong2(df * 8, 0), false);   // [8k, 8d]
-    \\      simdgroup_multiply_accumulate(Oreg[df], Pf, Vf, Oreg[df]);
+    \\      simdgroup_matrix<float, 8, 8> Otmp;
+    \\      reinterpret_cast<thread float2&>(Otmp.thread_elements()) = Oreg[df];   // load accumulator
+    \\      simdgroup_multiply_accumulate(Otmp, Pf, Vf, Otmp);      // O = P@V + O
+    \\      Oreg[df] = reinterpret_cast<thread float2&>(Otmp.thread_elements());   // store back
     \\    }
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
     \\  }
     \\
     \\  // Finalize: stage register O -> Os (threadgroup), then write rows < Tq with
     \\  // the 1/l normalization (bounds-safe for a partial last query tile).
-    \\  for (int df = 0; df < NDF; ++df) simdgroup_store(Oreg[df], Os, D, ulong2(df * 8, 0), false);
+    \\  for (int df = 0; df < NDF; ++df) {
+    \\    simdgroup_matrix<float, 8, 8> Otmp;
+    \\    reinterpret_cast<thread float2&>(Otmp.thread_elements()) = Oreg[df];
+    \\    simdgroup_store(Otmp, Os, D, ulong2(df * 8, 0), false);
+    \\  }
     \\  threadgroup_barrier(mem_flags::mem_threadgroup);
     \\  auto out_ = out + (b * Hq + h_q) * Tq * D;
     \\  for (int e = (int)lane; e < BQ * D; e += 32) {
