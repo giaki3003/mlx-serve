@@ -1121,6 +1121,10 @@ pub fn grailAttention(
 
     const config = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    // TEMP debug: print the generated Metal source + compiler diagnostic on first
+    // compile (per mlx custom_metal_kernels docs) so a kernel-compile crash is
+    // visible. Prints once (kernel is cached). Remove once the kernel is stable.
+    _ = mlx.mlx_fast_metal_kernel_config_set_verbose(config, true);
     const out_shape = [_]c_int{ B, Hq, Tq, D };
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, 4, .bfloat16));
     const n_qtiles: c_int = @divFloor(Tq + 31, 32); // ceil(Tq / BQ), BQ=32 (4 simdgroups per tile)
