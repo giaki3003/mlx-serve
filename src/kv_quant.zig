@@ -882,10 +882,11 @@ fn tiledCausalAttention(
 const GRAIL_KERNEL_SOURCE =
     \\  // Matrix-engine fused flash-attention-2. One simdgroup (32 lanes) handles a
     \\  // tile of BQ=8 query rows for (b, h_q). Q@K^T and P@V run on the GPU matrix
-    \\  // units via simdgroup_matrix MMA (8x8x8). The online softmax + the running O
-    \\  // accumulator live in THREADGROUP memory (scalar per-row ops) to avoid the
-    \\  // lane-layout coupling steel_attention needs. K/V tiles are dequantized
-    \\  // inline from the packed triple — no dense KV, no device-mem score matrix.
+    \\  // units via simdgroup_matrix MMA (8x8x8). The running O accumulator stays in
+    \\  // REGISTERS across the K-loop (per-row rescale via the Apple fragment layout,
+    \\  // 'fm' below) — no per-block threadgroup round-trip. Only the small softmax
+    \\  // (scores [BQ,BK]) uses threadgroup memory. K/V tiles are dequantized inline
+    \\  // from the packed triple — no dense KV, no device-mem score matrix.
     \\  constexpr int BQ = 8;
     \\  constexpr int BK = 8;
     \\  constexpr int NDF   = D / 8;                      // 8-wide head-dim frags (D=256 -> 32)
@@ -907,7 +908,7 @@ const GRAIL_KERNEL_SOURCE =
     \\
     \\  threadgroup float Qs[BQ * D];
     \\  threadgroup float KVs[BK * D];                    // K, then V (aliased per block)
-    \\  threadgroup float Os[BQ * D];                     // running output accumulator
+    \\  threadgroup float Os[BQ * D];                     // finalize staging (O is in registers during the loop)
     \\  threadgroup float Ss[BQ * BK];                    // scores, then probs
     \\  threadgroup float mrow[BQ];
     \\  threadgroup float lrow[BQ];
@@ -921,14 +922,21 @@ const GRAIL_KERNEL_SOURCE =
     \\  auto vsc_ = vsc + (b * Hkv + h_kv) * Tk * NG;
     \\  auto vbi_ = vbi + (b * Hkv + h_kv) * Tk * NG;
     \\
-    \\  // Load Q tile (zero-pad rows >= Tq), zero O, init running m/l.
+    \\  // Load Q tile (zero-pad rows >= Tq), init running m/l.
     \\  for (int e = (int)lane; e < BQ * D; e += 32) {
     \\    int r = e / D; int d = e % D; int qg = q_base + r;
     \\    Qs[e] = (qg < Tq) ? static_cast<float>(q_[qg * D + d]) : 0.0f;
-    \\    Os[e] = 0.0f;
     \\  }
     \\  if ((int)lane < BQ) { mrow[lane] = -INFINITY; lrow[lane] = 0.0f; }
     \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\  // O accumulator lives in REGISTERS across the whole K-loop — no per-block
+    \\  // threadgroup round-trip (that round-trip was the long-context crater).
+    \\  // 'fm' = this lane's fragment ROW in the Apple simdgroup_matrix 8x8 layout
+    \\  // (a lane owns 2 elements in one row), used for the per-row O rescale.
+    \\  int fm = (int)(((lane >> 1) & 1u) + 2u * ((lane >> 2) & 1u) + 4u * ((lane >> 4) & 1u));
+    \\  simdgroup_matrix<float, 8, 8> Oreg[NDF];
+    \\  for (int df = 0; df < NDF; ++df) Oreg[df] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     \\
     \\  int qmax_abs = q0 + q_base + (BQ - 1);            // upper bound on query pos in tile
     \\
@@ -989,9 +997,13 @@ const GRAIL_KERNEL_SOURCE =
     \\    }
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
     \\
-    \\    // Rescale running O by the per-row correction.
-    \\    for (int e = (int)lane; e < BQ * D; e += 32) Os[e] *= corr[e / D];
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    // Rescale running O (registers) by this lane's per-row correction.
+    \\    {
+    \\      float cr = corr[fm];
+    \\      for (int df = 0; df < NDF; ++df) {
+    \\        float2 el = Oreg[df].thread_elements(); el *= cr; Oreg[df].thread_elements() = el;
+    \\      }
+    \\    }
     \\
     \\    // Dequant V block -> KVs [BK, D].
     \\    for (int e = (int)lane; e < BK * D; e += 32) {
@@ -1005,20 +1017,21 @@ const GRAIL_KERNEL_SOURCE =
     \\    }
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
     \\
-    \\    // O += P @ V.
+    \\    // O += P @ V  (accumulate directly into the register O fragments).
     \\    simdgroup_matrix<float, 8, 8> Pf;
     \\    simdgroup_load(Pf, Ss, BK, ulong2(0, 0), false);          // [8q, 8k]
     \\    for (int df = 0; df < NDF; ++df) {
-    \\      simdgroup_matrix<float, 8, 8> Vf, Of;
+    \\      simdgroup_matrix<float, 8, 8> Vf;
     \\      simdgroup_load(Vf, KVs, D, ulong2(df * 8, 0), false);   // [8k, 8d]
-    \\      simdgroup_load(Of, Os,  D, ulong2(df * 8, 0), false);   // [8q, 8d]
-    \\      simdgroup_multiply_accumulate(Of, Pf, Vf, Of);
-    \\      simdgroup_store(Of, Os, D, ulong2(df * 8, 0), false);
+    \\      simdgroup_multiply_accumulate(Oreg[df], Pf, Vf, Oreg[df]);
     \\    }
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
     \\  }
     \\
-    \\  // Finalize: O / l, store rows < Tq.
+    \\  // Finalize: stage register O -> Os (threadgroup), then write rows < Tq with
+    \\  // the 1/l normalization (bounds-safe for a partial last query tile).
+    \\  for (int df = 0; df < NDF; ++df) simdgroup_store(Oreg[df], Os, D, ulong2(df * 8, 0), false);
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
     \\  auto out_ = out + (b * Hq + h_q) * Tq * D;
     \\  for (int e = (int)lane; e < BQ * D; e += 32) {
     \\    int r = e / D; int d = e % D; int qg = q_base + r;
