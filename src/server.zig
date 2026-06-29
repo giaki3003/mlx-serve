@@ -1346,12 +1346,14 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         0
     else if (prefill_tiled)
         kv_quant.tiledScoreTransientBytes(@intCast(heads), chunk, @as(u64, kv_quant.kv_attn_block), @intCast(prompt_len))
-    else if (!kv_quant.flashTilesAtHeadDim(hdim))
-        // Dense mode at a head_dim flash won't tile: it materializes the full
-        // score matrix. Bill that (huge) so we REJECT cleanly instead of OOMing.
-        kv_quant.denseScoresMaterializedBytes(@intCast(heads), chunk, @intCast(prompt_len))
     else
-        kv_quant.denseDequantTransientBytes(full_attn_layers, @intCast(prompt_len), kv_heads, hdim);
+        // Dense mode: quantized KV dequantized to f16 (stacks across full-attn
+        // layers) + the [H,chunk,kL] score matrix. flash-256 (#3660) caps that
+        // score at kL=16384 for hd 192/256 (above it the fork tiles), so a long
+        // hd-256 prefill that pre-flash billed the full ~7 GB score and got
+        // rejected is now billed the bounded transient flash-256 actually uses.
+        // hd<=128 reduces to the old dequant-only estimate (flash always tiles).
+        kv_quant.densePrefillAttnTransientBytes(@intCast(heads), kv_heads, chunk, @intCast(prompt_len), full_attn_layers, hdim);
     // Total estimate with 25% safety margin
     const needed: u64 = (kv_bytes + ssm_state_bytes + working_bytes + prefill_attn_transient) * 5 / 4;
 

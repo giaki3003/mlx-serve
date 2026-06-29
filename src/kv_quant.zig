@@ -578,6 +578,45 @@ pub fn denseScoresMaterializedBytes(h_q: u64, t_q: u64, t_k: u64) u64 {
     return DENSE_SCORE_COPIES * 4 * h_q * t_q * t_k;
 }
 
+/// Minimum key length at which the MLX fork's flash SDPA (#3660) tiles head_dim
+/// 192/256. BELOW it the unfused path materializes the full `[H,T_q,kL]` score
+/// matrix; AT/ABOVE it the steel kernel tiles K/V (bounded). Must match the
+/// `key_sequence_length > 16384` gate (`sdpa_full_large_hd_ok`) in the fork's
+/// mlx/backend/metal/scaled_dot_product_attention.cpp — bump both together.
+pub const flash_large_headdim_min_kl: u64 = 16384;
+
+/// Peak bytes of the DENSE (non-tiled) prefill attention transient for a
+/// QUANTIZED cache, accounting for the fork's flash-256 routing. Two terms,
+/// both live at the worst chunk:
+///   * dequant — the quantized KV is always dequantized to f16 to feed SDPA,
+///     stacked across full-attn layers (`denseDequantTransientBytes`).
+///   * score   — the `[H_q,T_q,kL]` matrix materializes ONLY for chunks whose
+///     cumulative kL has not crossed the flash threshold. So the peak score is
+///     CAPPED at kL=`flash_large_headdim_min_kl` for hd 192/256 (above it the
+///     fork tiles); hd<=128 always flashes (no score); any other hd never
+///     flashes (full materialization).
+/// Pre-flash-256 the admission billed the full-kL score ALONE (~7 GB at
+/// 57k×hd256) and rejected long hd-256 prefills that flash-256 now serves
+/// bounded; this caps the score and adds the (smaller, always-present) dequant.
+pub fn densePrefillAttnTransientBytes(
+    h_q: u64,
+    h_kv: u64,
+    t_q: u64,
+    t_k: u64,
+    full_attn_layers: u64,
+    hdim: u64,
+) u64 {
+    const dequant = denseDequantTransientBytes(full_attn_layers, t_k, h_kv, hdim);
+    const score_kl: u64 = if (hdim <= flash_sdpa_max_headdim)
+        0 // {64,80,128}: flash always tiles → no score matrix
+    else if (hdim == 192 or hdim == 256)
+        @min(t_k, flash_large_headdim_min_kl) // flashes above the threshold → capped
+    else
+        t_k; // a head_dim flash never tiles → full materialization
+    const score: u64 = if (score_kl == 0) 0 else denseScoresMaterializedBytes(h_q, t_q, score_kl);
+    return dequant + score;
+}
+
 /// Route a PREFILL attention chunk through the K-tiled fused path iff its
 /// bounded scores transient is both cheaper than the dense dequant it would
 /// replace AND under the absolute ceiling. The discriminator is T_q:
@@ -2187,6 +2226,45 @@ test "preferTiledPrefill routes warm small-T_q to tiled, cold full-chunk to dens
     kv_attn_tiled_budget_mb = 0;
     try testing.expect(!preferTiledPrefill(h_q, h_kv, 8192, block, t_k, fa, hdim));
     try testing.expect(preferTiledPrefill(h_q, h_kv, 251, block, t_k, fa, hdim));
+}
+
+test "densePrefillAttnTransientBytes caps the score at the flash-256 threshold (hd 256)" {
+    // Ornith prod dims: H_q=16, H_kv=4, hd=256, 8 full-attn layers, chunk 1024.
+    const h_q: u64 = 16;
+    const h_kv: u64 = 4;
+    const fa: u64 = 8;
+    const chunk: u64 = 1024;
+
+    // A 57k hd-256 prefill: pre-flash the admission billed the FULL-kL score
+    // (denseScoresMaterializedBytes(16,1024,57249) ≈ 7 GiB) and rejected a
+    // prompt flash-256 now serves bounded. The capped estimate = dequant +
+    // score AT THE THRESHOLD (16384), NOT the full 57k.
+    const t_k: u64 = 57_249;
+    const got = densePrefillAttnTransientBytes(h_q, h_kv, chunk, t_k, fa, 256);
+    try testing.expectEqual(
+        denseDequantTransientBytes(fa, t_k, h_kv, 256) +
+            denseScoresMaterializedBytes(h_q, chunk, flash_large_headdim_min_kl),
+        got,
+    );
+    // Red on revert: the old full-kL score ALONE (what got rejected) dwarfs the
+    // whole capped transient — so a revert to billing it fails here.
+    try testing.expect(got < denseScoresMaterializedBytes(h_q, chunk, t_k));
+
+    // Below the threshold (short ctx) flash-256 hasn't engaged: the score is NOT
+    // capped (full kL) and the dequant still applies.
+    const short: u64 = 8_000;
+    try testing.expectEqual(
+        denseDequantTransientBytes(fa, short, h_kv, 256) +
+            denseScoresMaterializedBytes(h_q, chunk, short),
+        densePrefillAttnTransientBytes(h_q, h_kv, chunk, short, fa, 256),
+    );
+
+    // hd<=128 always flashes: no score term, just the dequant — no regression
+    // vs the old `else` branch that billed denseDequantTransientBytes alone.
+    try testing.expectEqual(
+        denseDequantTransientBytes(fa, t_k, h_kv, 128),
+        densePrefillAttnTransientBytes(h_q, h_kv, chunk, t_k, fa, 128),
+    );
 }
 
 // ── TURBO × tiled × T_q>1 (the prod-config coverage gap) ──
