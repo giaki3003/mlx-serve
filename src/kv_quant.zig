@@ -852,6 +852,220 @@ fn tiledCausalAttention(
 /// `Rvᵀ` (= `Rv`, since the matrices are symmetric+orthogonal). Pass
 /// `.{ .ctx = null }` for either when that side is plain affine (no rotation).
 /// Returns a `[B, H, T_q, D]` bf16 array; caller owns and frees.
+// ─────────────────────────────────────────────────────────────────────────
+// GRAIL: fused quantized flash-attention-2 as a single runtime Metal kernel.
+//
+// Same online-softmax math as `quantAttention` (the graph-level reference
+// below), but FUSED into ONE `mlx_fast_metal_kernel` (the GDN-kernel pattern)
+// instead of a per-block graph of `quantized_matmul` + softmax ops — so it pays
+// no per-block op-launch overhead (the thing that craters quantAttention at long
+// context) AND never materializes a score matrix or a dense K/V (it dequantizes
+// each K/V element inline from the packed-uint32 + bf16 scale/bias triple).
+//
+// AFFINE-ONLY by contract: the TurboQuant Hadamard rotations stay OUTSIDE the
+// kernel exactly as in `quantAttention` — Q is rotated by Rk on the way in and
+// the output by Rv on the way out (no-ops when the rotation ctx is null). Opt-in
+// behind `--kv-attn-grail`; the proven `quantAttention` stays the fallback (and
+// serves the rare explicit-array-mask path).
+//
+// Layout: one simdgroup (32 lanes) per (b, h_q, t_q) output row. The 32 lanes
+// split head_dim D into 32 contiguous slices of DPT=D/32; lane L owns dims
+// [L*DPT, L*DPT+DPT). The score dot is a per-lane partial reduced by simd_sum;
+// the P@V accumulate is lane-local (each lane owns its output dims). Correctness
+// first (no K-tiling/reuse yet); optimize after parity is green.
+const GRAIL_KERNEL_SOURCE =
+    \\  uint lane = thread_position_in_threadgroup.x;     // 0..31 within the simdgroup
+    \\  uint t_q  = thread_position_in_grid.y;            // query row
+    \\  uint nbh  = thread_position_in_grid.z;            // b * Hq + h_q
+    \\  uint b    = nbh / Hq;
+    \\  uint h_q  = nbh % Hq;
+    \\  uint h_kv = h_q / (Hq / Hkv);                     // GQA: q-head -> kv-head
+    \\
+    \\  constexpr int DPT   = D / 32;                     // head dims per lane
+    \\  constexpr int KPACK = 32 / KB;                    // K values per uint32
+    \\  constexpr int VPACK = 32 / VB;                    // V values per uint32
+    \\  constexpr int NG    = D / GS;                     // scale/bias groups per row
+    \\  constexpr int KQROW = D / KPACK;                  // uint32 words per K row
+    \\  constexpr int VQROW = D / VPACK;                  // uint32 words per V row
+    \\  constexpr uint KMASK = (1u << KB) - 1u;
+    \\  constexpr uint VMASK = (1u << VB) - 1u;
+    \\
+    \\  auto q_ = q + ((b * Hq + h_q) * Tq + t_q) * D;
+    \\  float qreg[DPT];
+    \\  for (int i = 0; i < DPT; ++i) qreg[i] = static_cast<float>(q_[lane * DPT + i]);
+    \\
+    \\  auto kq_  = kq  + (b * Hkv + h_kv) * Tk * KQROW;
+    \\  auto ksc_ = ksc + (b * Hkv + h_kv) * Tk * NG;
+    \\  auto kbi_ = kbi + (b * Hkv + h_kv) * Tk * NG;
+    \\  auto vq_  = vq  + (b * Hkv + h_kv) * Tk * VQROW;
+    \\  auto vsc_ = vsc + (b * Hkv + h_kv) * Tk * NG;
+    \\  auto vbi_ = vbi + (b * Hkv + h_kv) * Tk * NG;
+    \\
+    \\  int qpos = q0 + (int)t_q;                         // absolute query position (causal)
+    \\
+    \\  float m = -INFINITY;                              // running max
+    \\  float l = 0.0f;                                   // running denom
+    \\  float acc[DPT];                                   // running weighted V (lane-local)
+    \\  for (int i = 0; i < DPT; ++i) acc[i] = 0.0f;
+    \\
+    \\  for (int t = 0; t < Tk; ++t) {
+    \\    if (causal != 0 && t > qpos) break;             // skip strictly-future keys
+    \\
+    \\    auto kq_row  = kq_  + t * KQROW;
+    \\    auto ksc_row = ksc_ + t * NG;
+    \\    auto kbi_row = kbi_ + t * NG;
+    \\    float partial = 0.0f;
+    \\    for (int i = 0; i < DPT; ++i) {
+    \\      int d = lane * DPT + i;
+    \\      uint code = (kq_row[d / KPACK] >> (KB * (d % KPACK))) & KMASK;
+    \\      float kf = static_cast<float>(code) * static_cast<float>(ksc_row[d / GS])
+    \\               + static_cast<float>(kbi_row[d / GS]);
+    \\      partial += qreg[i] * kf;
+    \\    }
+    \\    float score = simd_sum(partial) * scale;        // full Q.K dot, then scale
+    \\
+    \\    float m_new = max(m, score);
+    \\    float corr  = (m == -INFINITY) ? 0.0f : exp(m - m_new);
+    \\    float p     = exp(score - m_new);
+    \\    m = m_new;
+    \\    l = l * corr + p;
+    \\
+    \\    auto vq_row  = vq_  + t * VQROW;
+    \\    auto vsc_row = vsc_ + t * NG;
+    \\    auto vbi_row = vbi_ + t * NG;
+    \\    for (int i = 0; i < DPT; ++i) {
+    \\      int d = lane * DPT + i;
+    \\      uint code = (vq_row[d / VPACK] >> (VB * (d % VPACK))) & VMASK;
+    \\      float vf = static_cast<float>(code) * static_cast<float>(vsc_row[d / GS])
+    \\               + static_cast<float>(vbi_row[d / GS]);
+    \\      acc[i] = acc[i] * corr + p * vf;
+    \\    }
+    \\  }
+    \\
+    \\  auto out_ = out + ((b * Hq + h_q) * Tq + t_q) * D;
+    \\  float inv_l = 1.0f / max(l, 1e-9f);
+    \\  for (int i = 0; i < DPT; ++i) {
+    \\    out_[lane * DPT + i] = static_cast<OutT>(acc[i] * inv_l);
+    \\  }
+;
+
+var grail_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getGrailKernel() !mlx.mlx_fast_metal_kernel {
+    if (grail_kernel_cached) |k| return k;
+    const input_names = [_][*:0]const u8{ "q", "kq", "ksc", "kbi", "vq", "vsc", "vbi", "scale", "Tk", "Tq", "q0", "causal" };
+    const output_names = [_][*:0]const u8{"out"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "grail_fused_quant_attn",
+        in_vec,
+        out_vec,
+        GRAIL_KERNEL_SOURCE,
+        "",
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    grail_kernel_cached = kernel;
+    return kernel;
+}
+
+/// Fused-quant flash attention via the grail Metal kernel. Drop-in for
+/// `quantAttention` (identical signature). K/V share `group_size`. The explicit
+/// "array"-mask path defers to `quantAttention` (the kernel covers causal + the
+/// empty/decode mask, the hot path). Caller owns the returned bf16 [B,Hq,Tq,D].
+pub fn grailAttention(
+    q_dense: mlx.mlx_array,
+    k_triple: BorrowedTriple,
+    v_triple: BorrowedTriple,
+    k_bits: u8,
+    k_group_size: u32,
+    v_bits: u8,
+    v_group_size: u32,
+    rk: mlx.mlx_array,
+    rv: mlx.mlx_array,
+    scale: f32,
+    mask_mode: []const u8,
+    mask_arr: mlx.mlx_array,
+    s: mlx.mlx_stream,
+) !mlx.mlx_array {
+    if (std.mem.eql(u8, mask_mode, "array")) {
+        return quantAttention(q_dense, k_triple, v_triple, k_bits, k_group_size, v_bits, v_group_size, rk, rv, scale, mask_mode, mask_arr, s);
+    }
+
+    const qs = mlx.getShape(q_dense);
+    if (qs.len != 4) return error.UnexpectedQShape;
+    const B = qs[0];
+    const Hq = qs[1];
+    const Tq = qs[2];
+    const D = qs[3];
+
+    const kss = mlx.getShape(k_triple.scales);
+    if (kss.len != 4) return error.UnexpectedKShape;
+    const Hkv = kss[1];
+    const Tk = kss[2];
+
+    // Rotate Q into K's stored (Hadamard) basis when K is turbo; no-op otherwise.
+    const q_rot = if (rk.ctx != null) try rotateLastDim(s, q_dense, rk) else q_dense;
+    defer {
+        if (rk.ctx != null) _ = mlx.mlx_array_free(q_rot);
+    }
+
+    const causal: c_int = if (std.mem.eql(u8, mask_mode, "causal")) 1 else 0;
+    const q0: c_int = Tk - Tq; // queries are right-anchored within the K window
+
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    const out_shape = [_]c_int{ B, Hq, Tq, D };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, 4, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, Tq, B * Hq));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "OutT", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "D", D));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hq", Hq));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hkv", Hkv));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(k_group_size)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "KB", @intCast(k_bits)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "VB", @intCast(v_bits)));
+    // NOTE: K and V share group_size; the kernel uses a single GS (k_group_size).
+
+    const scale_arr = mlx.mlx_array_new_float(scale);
+    defer _ = mlx.mlx_array_free(scale_arr);
+    const tk_arr = mlx.mlx_array_new_int(Tk);
+    defer _ = mlx.mlx_array_free(tk_arr);
+    const tq_arr = mlx.mlx_array_new_int(Tq);
+    defer _ = mlx.mlx_array_free(tq_arr);
+    const q0_arr = mlx.mlx_array_new_int(q0);
+    defer _ = mlx.mlx_array_free(q0_arr);
+    const causal_arr = mlx.mlx_array_new_int(causal);
+    defer _ = mlx.mlx_array_free(causal_arr);
+
+    const inputs_arr = [_]mlx.mlx_array{ q_rot, k_triple.q, k_triple.scales, k_triple.biases, v_triple.q, v_triple.scales, v_triple.biases, scale_arr, tk_arr, tq_arr, q0_arr, causal_arr };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+
+    const kernel = try getGrailKernel();
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+
+    // Undo V's stored rotation when V is turbo: out @ Rv. No-op otherwise.
+    if (rv.ctx != null) {
+        const out_rot = try rotateLastDim(s, out, rv);
+        _ = mlx.mlx_array_free(out);
+        out = out_rot;
+    }
+    return out;
+}
+
 pub fn quantAttention(
     q_dense: mlx.mlx_array,
     k_triple: BorrowedTriple,
@@ -2334,4 +2548,139 @@ test "tiled TURBO: K turbo4 + V turbo4 (Rk != Rv), T_q>1 multi-block causal matc
         if (std.math.isNan(e) or e > max_err) max_err = e;
     }
     try testing.expect(max_err < 0.05);
+}
+
+// ── GRAIL fused-kernel parity (PROD dims: D=256, H_q=16, H_kv=4) ──
+// K affine-8 + V turbo-4. Reference = dense flash SDPA over the per-side
+// dequantization of the SAME triples, so only the fused kernel's attention math
+// is under test. Asserts a bf16-reduction max-abs tolerance AND an explicit
+// zero-NaN invariant (the all-NaN straddling-mask failure class).
+
+fn expectGrailParity(s: mlx.mlx_stream, ref: mlx.mlx_array, cand: mlx.mlx_array) !void {
+    const ref_flat = try readF32Flat(s, ref, testing.allocator);
+    defer testing.allocator.free(ref_flat);
+    const cand_flat = try readF32Flat(s, cand, testing.allocator);
+    defer testing.allocator.free(cand_flat);
+    try testing.expectEqual(ref_flat.len, cand_flat.len);
+    var max_err: f32 = 0;
+    var nan_count: usize = 0;
+    for (ref_flat, cand_flat) |r, c| {
+        if (std.math.isNan(c) or std.math.isInf(c)) nan_count += 1;
+        const e = @abs(r - c);
+        if (std.math.isNan(e) or e > max_err) max_err = e;
+    }
+    try testing.expectEqual(@as(usize, 0), nan_count);
+    try testing.expect(max_err < 0.05);
+}
+
+test "GRAIL fused parity: K affine8 + V turbo4 PROD dims (decode, T_q=1, multi-block)" {
+    const s = mlx.gpuStream();
+    const saved = kv_attn_block;
+    kv_attn_block = 4;
+    defer kv_attn_block = saved;
+
+    const B: c_int = 1;
+    const H_q: c_int = 16;
+    const H_kv: c_int = 4;
+    const T_k: c_int = 10;
+    const D: c_int = 256;
+    const gs: u32 = 64;
+
+    const q = try buildSmoothBHTD(s, B, H_q, 1, D);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = try buildSmoothBHTD(s, B, H_kv, T_k, D);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = try buildSmoothBHTD(s, B, H_kv, T_k, D);
+    defer _ = mlx.mlx_array_free(v_dense);
+
+    var ts = try TurboState.initHadamard(testing.allocator, s, 1, @intCast(D));
+    defer ts.deinit();
+    const rv = ts.rv[0];
+
+    var qk = try quantizeAffine(s, k_dense, gs, 8);
+    defer qk.deinit();
+    var qv = try quantizeTurbo(s, v_dense, rv, gs, 4);
+    defer qv.deinit();
+
+    const k_ref = try dequantizeAffine(s, qk.q, qk.scales, qk.biases, gs, 8);
+    defer _ = mlx.mlx_array_free(k_ref);
+    const v_ref = try dequantizeTurbo(s, qv.q, qv.scales, qv.biases, rv, gs, 4);
+    defer _ = mlx.mlx_array_free(v_ref);
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    var ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref);
+    const none_mask = mlx.mlx_array{ .ctx = null };
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(
+        &ref, q, k_ref, v_ref, scale, "", none_mask, .{ .ctx = null }, s,
+    ));
+
+    const cand = try grailAttention(
+        q,
+        .{ .q = qk.q, .scales = qk.scales, .biases = qk.biases },
+        .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
+        8, gs, 4, gs,
+        .{ .ctx = null }, // rk: K affine
+        rv, // rv: V turbo
+        scale, "", none_mask, s,
+    );
+    defer _ = mlx.mlx_array_free(cand);
+
+    try expectGrailParity(s, ref, cand);
+}
+
+test "GRAIL fused parity: K affine8 + V turbo4 PROD dims (prefill, T_q>1, causal straddle)" {
+    const s = mlx.gpuStream();
+    const saved = kv_attn_block;
+    kv_attn_block = 8;
+    defer kv_attn_block = saved;
+
+    const B: c_int = 1;
+    const H_q: c_int = 16;
+    const H_kv: c_int = 4;
+    const T_q: c_int = 3;
+    const T_k: c_int = 30;
+    const D: c_int = 256;
+    const gs: u32 = 64;
+
+    const q = try buildSmoothBHTD(s, B, H_q, T_q, D);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = try buildSmoothBHTD(s, B, H_kv, T_k, D);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = try buildSmoothBHTD(s, B, H_kv, T_k, D);
+    defer _ = mlx.mlx_array_free(v_dense);
+
+    var ts = try TurboState.initHadamard(testing.allocator, s, 1, @intCast(D));
+    defer ts.deinit();
+    const rv = ts.rv[0];
+
+    var qk = try quantizeAffine(s, k_dense, gs, 8);
+    defer qk.deinit();
+    var qv = try quantizeTurbo(s, v_dense, rv, gs, 4);
+    defer qv.deinit();
+
+    const k_ref = try dequantizeAffine(s, qk.q, qk.scales, qk.biases, gs, 8);
+    defer _ = mlx.mlx_array_free(k_ref);
+    const v_ref = try dequantizeTurbo(s, qv.q, qv.scales, qv.biases, rv, gs, 4);
+    defer _ = mlx.mlx_array_free(v_ref);
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    var ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref);
+    const none_mask = mlx.mlx_array{ .ctx = null };
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(
+        &ref, q, k_ref, v_ref, scale, "causal", none_mask, .{ .ctx = null }, s,
+    ));
+
+    const cand = try grailAttention(
+        q,
+        .{ .q = qk.q, .scales = qk.scales, .biases = qk.biases },
+        .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
+        8, gs, 4, gs,
+        .{ .ctx = null }, rv,
+        scale, "causal", none_mask, s,
+    );
+    defer _ = mlx.mlx_array_free(cand);
+
+    try expectGrailParity(s, ref, cand);
 }
