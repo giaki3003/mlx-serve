@@ -880,14 +880,15 @@ fn tiledCausalAttention(
 // the P@V accumulate is lane-local (each lane owns its output dims). Correctness
 // first (no K-tiling/reuse yet); optimize after parity is green.
 const GRAIL_KERNEL_SOURCE =
-    \\  // Matrix-engine fused flash-attention-2. One simdgroup (32 lanes) handles a
-    \\  // tile of BQ=8 query rows for (b, h_q). Q@K^T and P@V run on the GPU matrix
-    \\  // units via simdgroup_matrix MMA (8x8x8). The running O accumulator stays in
-    \\  // REGISTERS across the K-loop (per-row rescale via the Apple fragment layout,
-    \\  // 'fm' below) — no per-block threadgroup round-trip. Only the small softmax
-    \\  // (scores [BQ,BK]) uses threadgroup memory. K/V tiles are dequantized inline
-    \\  // from the packed triple — no dense KV, no device-mem score matrix.
-    \\  constexpr int BQ = 8;
+    \\  // Matrix-engine fused flash-attention-2, MULTI-SIMDGROUP. One threadgroup =
+    \\  // WM=4 simdgroups (128 threads) over BQ=32 query rows for (b, h_q); simdgroup
+    \\  // sgid owns rows [sgid*8, sgid*8+8). The K/V tile is dequantized ONCE per
+    \\  // block by all 128 threads and reused by all 4 simdgroups (kills the
+    \\  // per-query-tile redundant dequant + raises occupancy). Q@K^T and P@V on the
+    \\  // matrix units (half operands -> float accumulate). O stays in REGISTERS
+    \\  // (float2 per frag); softmax in threadgroup. f16 tiles fit the 32 KB budget.
+    \\  constexpr int WM = 4;
+    \\  constexpr int BQ = 32;
     \\  constexpr int BK = 8;
     \\  constexpr int NDF   = D / 8;                      // 8-wide head-dim frags (D=256 -> 32)
     \\  constexpr int KPACK = 32 / KB;
@@ -897,19 +898,23 @@ const GRAIL_KERNEL_SOURCE =
     \\  constexpr int VQROW = D / VPACK;
     \\  constexpr uint KMASK = (1u << KB) - 1u;
     \\  constexpr uint VMASK = (1u << VB) - 1u;
+    \\  constexpr int NT = WM * 32;                       // threads per threadgroup (128)
     \\
-    \\  uint lane   = thread_position_in_threadgroup.x;   // 0..31 (one simdgroup)
-    \\  uint qtile  = thread_position_in_grid.y;          // query-tile index
+    \\  uint tid    = thread_position_in_threadgroup.x;   // 0..NT-1
+    \\  uint lane   = tid % 32u;                          // within-simdgroup lane (1D threadgroup)
+    \\  uint sgid   = tid / 32u;                          // simdgroup index 0..WM-1
+    \\  uint qtile  = thread_position_in_grid.y;
     \\  uint nbh    = thread_position_in_grid.z;          // b * Hq + h_q
     \\  uint b      = nbh / Hq;
     \\  uint h_q    = nbh % Hq;
     \\  uint h_kv   = h_q / (Hq / Hkv);                   // GQA
     \\  int  q_base = (int)qtile * BQ;                    // first query row of this tile
+    \\  int  sg_row = (int)sgid * 8;                      // this simdgroup's row offset in the tile
     \\
-    \\  threadgroup float Qs[BQ * D];
-    \\  threadgroup float KVs[BK * D];                    // K, then V (aliased per block)
-    \\  threadgroup float Os[BQ * D];                     // finalize staging (O is in registers during the loop)
-    \\  threadgroup float Ss[BQ * BK];                    // scores, then probs
+    \\  threadgroup half  Qs[BQ * D];                     // Q tile (reused as O-staging at finalize)
+    \\  threadgroup half  KVs[BK * D];                    // K, then V (aliased per block)
+    \\  threadgroup float Ss[BQ * BK];                    // scores (f32) for softmax
+    \\  threadgroup half  Ps[BQ * BK];                    // probs (half) for the P@V MMA operand
     \\  threadgroup float mrow[BQ];
     \\  threadgroup float lrow[BQ];
     \\  threadgroup float corr[BQ];
@@ -922,55 +927,54 @@ const GRAIL_KERNEL_SOURCE =
     \\  auto vsc_ = vsc + (b * Hkv + h_kv) * Tk * NG;
     \\  auto vbi_ = vbi + (b * Hkv + h_kv) * Tk * NG;
     \\
-    \\  // Load Q tile (zero-pad rows >= Tq), init running m/l.
-    \\  for (int e = (int)lane; e < BQ * D; e += 32) {
+    \\  // Cooperative Q load (zero-pad rows >= Tq), all NT threads.
+    \\  for (int e = (int)tid; e < BQ * D; e += NT) {
     \\    int r = e / D; int d = e % D; int qg = q_base + r;
-    \\    Qs[e] = (qg < Tq) ? static_cast<float>(q_[qg * D + d]) : 0.0f;
+    \\    Qs[e] = (half)((qg < Tq) ? static_cast<float>(q_[qg * D + d]) : 0.0f);
     \\  }
-    \\  if ((int)lane < BQ) { mrow[lane] = -INFINITY; lrow[lane] = 0.0f; }
+    \\  if ((int)tid < BQ) { mrow[tid] = -INFINITY; lrow[tid] = 0.0f; }
     \\  threadgroup_barrier(mem_flags::mem_threadgroup);
     \\
-    \\  // O accumulator lives in REGISTERS across the whole K-loop — no per-block
-    \\  // threadgroup round-trip (that round-trip was the long-context crater).
-    \\  // 'fm' = this lane's fragment ROW in the Apple simdgroup_matrix 8x8 layout
-    \\  // (a lane owns 2 elements in one row), used for the per-row O rescale.
+    \\  // 'fm' = this lane's fragment ROW (Apple simdgroup_matrix 8x8 layout: a lane
+    \\  // owns 2 elems in one row); my_row = the query row this lane's O frags hold.
     \\  int fm = (int)(((lane >> 1) & 1u) + 2u * ((lane >> 2) & 1u) + 4u * ((lane >> 4) & 1u));
-    \\  float2 Oreg[NDF];                                 // O accumulator: per-lane frag storage
+    \\  int my_row = sg_row + fm;
+    \\  float2 Oreg[NDF];                                 // O accumulator in registers
     \\  for (int df = 0; df < NDF; ++df) Oreg[df] = float2(0.0f, 0.0f);
     \\
-    \\  int qmax_abs = q0 + q_base + (BQ - 1);            // upper bound on query pos in tile
+    \\  int qmax_abs = q0 + q_base + (BQ - 1);
     \\
     \\  for (int k0 = 0; k0 < Tk; k0 += BK) {
     \\    if (causal != 0 && k0 > qmax_abs) break;
     \\
-    \\    // Dequant K block -> KVs [BK, D] (zero past Tk).
-    \\    for (int e = (int)lane; e < BK * D; e += 32) {
+    \\    // Cooperative K dequant -> KVs [BK, D] (half; zero past Tk).
+    \\    for (int e = (int)tid; e < BK * D; e += NT) {
     \\      int kk = e / D; int d = e % D; int kg = k0 + kk; float val = 0.0f;
     \\      if (kg < Tk) {
     \\        auto row = kq_ + kg * KQROW; auto sc = ksc_ + kg * NG; auto bi = kbi_ + kg * NG;
     \\        uint code = (row[d / KPACK] >> (KB * (d % KPACK))) & KMASK;
     \\        val = static_cast<float>(code) * static_cast<float>(sc[d / GS]) + static_cast<float>(bi[d / GS]);
     \\      }
-    \\      KVs[e] = val;
+    \\      KVs[e] = (half)val;
     \\    }
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
     \\
-    \\    // S = Q @ K^T  (contract D over NDF 8-wide frags).
+    \\    // S = Q @ K^T for THIS simdgroup's 8 rows (half operands -> float accum).
     \\    simdgroup_matrix<float, 8, 8> Sf = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     \\    for (int df = 0; df < NDF; ++df) {
-    \\      simdgroup_matrix<float, 8, 8> Qf, Kf;
-    \\      simdgroup_load(Qf, Qs,  D, ulong2(df * 8, 0), false);   // [8q, 8d]
-    \\      simdgroup_load(Kf, KVs, D, ulong2(df * 8, 0), true);    // [8d, 8k] (K stored [k,d])
+    \\      simdgroup_matrix<half, 8, 8> Qf, Kf;
+    \\      simdgroup_load(Qf, Qs,  D, ulong2(df * 8, sg_row), false);  // [8q, 8d]
+    \\      simdgroup_load(Kf, KVs, D, ulong2(df * 8, 0), true);        // [8d, 8k]
     \\      simdgroup_multiply_accumulate(Sf, Qf, Kf, Sf);
     \\    }
-    \\    simdgroup_store(Sf, Ss, BK, ulong2(0, 0), false);         // Ss [8q, 8k]
+    \\    simdgroup_store(Sf, Ss, BK, ulong2(0, sg_row), false);        // this sg's Ss rows
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
     \\
-    \\    // Online softmax over this block (one lane per query row) + record corr.
-    \\    if ((int)lane < BQ) {
-    \\      int r = (int)lane; int qg = q_base + r;
+    \\    // Softmax: lanes 0..7 of each simdgroup handle its 8 rows.
+    \\    if (lane < 8) {
+    \\      int r = sg_row + (int)lane; int qg = q_base + r;
     \\      if (qg >= Tq) {
-    \\        for (int kk = 0; kk < BK; ++kk) Ss[r * BK + kk] = 0.0f;
+    \\        for (int kk = 0; kk < BK; ++kk) Ps[r * BK + kk] = (half)0.0f;
     \\        corr[r] = 1.0f;
     \\      } else {
     \\        float blkmax = -INFINITY;
@@ -989,7 +993,7 @@ const GRAIL_KERNEL_SOURCE =
     \\        for (int kk = 0; kk < BK; ++kk) {
     \\          float sv = Ss[r * BK + kk];
     \\          float p = (sv == -INFINITY) ? 0.0f : exp(sv - m_new);
-    \\          Ss[r * BK + kk] = p;
+    \\          Ps[r * BK + kk] = (half)p;
     \\          lsum += p;
     \\        }
     \\        mrow[r] = m_new; lrow[r] = lrow[r] * c + lsum; corr[r] = c;
@@ -997,53 +1001,53 @@ const GRAIL_KERNEL_SOURCE =
     \\    }
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
     \\
-    \\    // Rescale running O (registers) by this lane's per-row correction.
+    \\    // Rescale this simdgroup's O (registers) by the per-row correction.
     \\    {
-    \\      float cr = corr[fm];
+    \\      float cr = corr[my_row];
     \\      for (int df = 0; df < NDF; ++df) Oreg[df] *= cr;
     \\    }
     \\
-    \\    // Dequant V block -> KVs [BK, D].
-    \\    for (int e = (int)lane; e < BK * D; e += 32) {
+    \\    // Cooperative V dequant -> KVs [BK, D] (half).
+    \\    for (int e = (int)tid; e < BK * D; e += NT) {
     \\      int kk = e / D; int d = e % D; int kg = k0 + kk; float val = 0.0f;
     \\      if (kg < Tk) {
     \\        auto row = vq_ + kg * VQROW; auto sc = vsc_ + kg * NG; auto bi = vbi_ + kg * NG;
     \\        uint code = (row[d / VPACK] >> (VB * (d % VPACK))) & VMASK;
     \\        val = static_cast<float>(code) * static_cast<float>(sc[d / GS]) + static_cast<float>(bi[d / GS]);
     \\      }
-    \\      KVs[e] = val;
+    \\      KVs[e] = (half)val;
     \\    }
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
     \\
-    \\    // O += P @ V  (accumulate directly into the register O fragments).
-    \\    simdgroup_matrix<float, 8, 8> Pf;
-    \\    simdgroup_load(Pf, Ss, BK, ulong2(0, 0), false);          // [8q, 8k]
+    \\    // O += P @ V for this simdgroup (half operands -> float accum).
+    \\    simdgroup_matrix<half, 8, 8> Pf;
+    \\    simdgroup_load(Pf, Ps, BK, ulong2(0, sg_row), false);         // [8q, 8k]
     \\    for (int df = 0; df < NDF; ++df) {
-    \\      simdgroup_matrix<float, 8, 8> Vf;
-    \\      simdgroup_load(Vf, KVs, D, ulong2(df * 8, 0), false);   // [8k, 8d]
+    \\      simdgroup_matrix<half, 8, 8> Vf;
+    \\      simdgroup_load(Vf, KVs, D, ulong2(df * 8, 0), false);       // [8k, 8d]
     \\      simdgroup_matrix<float, 8, 8> Otmp;
-    \\      reinterpret_cast<thread float2&>(Otmp.thread_elements()) = Oreg[df];   // load accumulator
-    \\      simdgroup_multiply_accumulate(Otmp, Pf, Vf, Otmp);      // O = P@V + O
-    \\      Oreg[df] = reinterpret_cast<thread float2&>(Otmp.thread_elements());   // store back
+    \\      reinterpret_cast<thread float2&>(Otmp.thread_elements()) = Oreg[df];
+    \\      simdgroup_multiply_accumulate(Otmp, Pf, Vf, Otmp);
+    \\      Oreg[df] = reinterpret_cast<thread float2&>(Otmp.thread_elements());
     \\    }
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
     \\  }
     \\
-    \\  // Finalize: stage register O -> Os (threadgroup), then write rows < Tq with
-    \\  // the 1/l normalization (bounds-safe for a partial last query tile).
+    \\  // Finalize: scale O by 1/l, stage into Qs (half), copy rows < Tq to out.
+    \\  {
+    \\    float invl = 1.0f / max(lrow[my_row], 1e-9f);
+    \\    for (int df = 0; df < NDF; ++df) Oreg[df] *= invl;
+    \\  }
     \\  for (int df = 0; df < NDF; ++df) {
     \\    simdgroup_matrix<float, 8, 8> Otmp;
     \\    reinterpret_cast<thread float2&>(Otmp.thread_elements()) = Oreg[df];
-    \\    simdgroup_store(Otmp, Os, D, ulong2(df * 8, 0), false);
+    \\    simdgroup_store(Otmp, Qs, D, ulong2(df * 8, sg_row), false);
     \\  }
     \\  threadgroup_barrier(mem_flags::mem_threadgroup);
     \\  auto out_ = out + (b * Hq + h_q) * Tq * D;
-    \\  for (int e = (int)lane; e < BQ * D; e += 32) {
+    \\  for (int e = (int)tid; e < BQ * D; e += NT) {
     \\    int r = e / D; int d = e % D; int qg = q_base + r;
-    \\    if (qg < Tq) {
-    \\      float l = max(lrow[r], 1e-9f);
-    \\      out_[qg * D + d] = static_cast<OutT>(Os[e] / l);
-    \\    }
+    \\    if (qg < Tq) out_[qg * D + d] = static_cast<OutT>(Qs[e]);
     \\  }
 ;
 
@@ -1119,9 +1123,9 @@ pub fn grailAttention(
     defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
     const out_shape = [_]c_int{ B, Hq, Tq, D };
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, 4, .bfloat16));
-    const n_qtiles: c_int = @divFloor(Tq + 7, 8); // ceil(Tq / BQ), BQ=8: one simdgroup per 8-query tile
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, n_qtiles, B * Hq));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
+    const n_qtiles: c_int = @divFloor(Tq + 31, 32); // ceil(Tq / BQ), BQ=32 (4 simdgroups per tile)
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 128, n_qtiles, B * Hq));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "OutT", .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "D", D));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hq", Hq));
